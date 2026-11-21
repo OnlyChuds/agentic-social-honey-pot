@@ -272,6 +272,7 @@ class RunManager:
                     str(run_no),
                     "--data-dir",
                     str(target_dir),
+                    "--stub-missing-agents",
                 ]
 
             if zero_pacing:

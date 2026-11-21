@@ -124,7 +124,7 @@ class _StubIdentityAgent:
             signature="Lena Hofer\nOperations Coordinator",
         )
         payload: dict[str, Any] = {"manifest": manifest.model_dump(mode="json")}
-        if mode == "landing_page":
+        if mode in {"landing_page", "revise"}:
             spec = kwargs.get("landing_page_spec") or {}
             title = str(spec.get("pretext") or "Portal Verification")
             fields = list(spec.get("fields") or ["email", "password"])
@@ -375,9 +375,14 @@ def discover_agents(
     cfg: AppConfig,
     llm: TextLLMClient,
     image_client: ImageClient | None = None,
+    *,
+    renderer: Any | None = None,
+    stub_missing: bool = False,
+    stub_objective: Objective = "credentials",
 ) -> AgentRegistry:
     """Auto-wire Role 2 & Role 3 agents if their modules are merged in src/agents/."""
-    return AgentRegistry(
+    assets_dir = cfg.run.data_dir / "assets"
+    registry = AgentRegistry(
         osint=_try_load_agent("src.agents.osint", "OsintAgent", llm, config=cfg),
         profile=_try_load_agent("src.agents.profile", "ProfileAgent", llm),
         identity=_try_load_agent(
@@ -385,11 +390,42 @@ def discover_agents(
             "IdentityAgent",
             llm,
             image_client=image_client,
+            assets_dir=assets_dir,
         ),
         strategy=_try_load_agent("src.agents.strategy", "StrategyAgent", llm),
         messaging=_try_load_agent("src.agents.messaging", "MessagingAgent", llm),
-        qa=_try_load_agent("src.agents.qa", "QAAgent", llm),
+        qa=_try_load_agent(
+            "src.agents.qa",
+            "QAAgent",
+            llm,
+            renderer=renderer,
+            max_revisions=cfg.budgets.max_revisions,
+        ),
     )
+    if stub_missing:
+        stubs = build_stub_agents(objective=stub_objective, assets_dir=cfg.run.data_dir / "_stub_assets")
+        if registry.osint is None:
+            registry.osint = stubs.osint
+        if registry.profile is None:
+            registry.profile = stubs.profile
+        if registry.identity is None:
+            registry.identity = stubs.identity
+        if registry.strategy is None:
+            registry.strategy = stubs.strategy
+        if registry.messaging is None:
+            registry.messaging = stubs.messaging
+        if registry.qa is None:
+            registry.qa = stubs.qa
+    return registry
+
+
+def _create_html_renderer() -> Any | None:
+    try:
+        mod = importlib.import_module("src.render.screenshot")
+    except ModuleNotFoundError:
+        return None
+    cls = getattr(mod, "HtmlRenderer", None)
+    return cls() if cls is not None else None
 
 
 async def run_from_args(args: argparse.Namespace) -> Snapshot:
@@ -409,6 +445,9 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
     db_path = cfg.run.data_dir / f"{cfg.run.scenario}_{cfg.run.target_id}_run{cfg.run.run_no}.db"
     store = Store(db_path)
 
+    llm: TextLLMClient | None = None
+    img: ImageClient | None = None
+    renderer: Any | None = None
     try:
         state = StateManager.recover(store) if args.resume else StateManager(store)
         policy = TriggerPolicy(
@@ -420,8 +459,6 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
             max_revisions=cfg.budgets.max_revisions,
         )
 
-        llm: TextLLMClient | None = None
-        img: ImageClient | None = None
         if args.dry_run_stub_agents:
             agents = build_stub_agents(
                 objective=args.stub_objective,
@@ -431,7 +468,17 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
             llm = TextLLMClient.from_config(cfg.models.text)
             if cfg.models.image.base_url:
                 img = ImageClient.from_config(cfg.models.image)
-            agents = discover_agents(cfg, llm, img)
+            renderer = _create_html_renderer()
+            if renderer is not None and hasattr(renderer, "__aenter__"):
+                await renderer.__aenter__()
+            agents = discover_agents(
+                cfg,
+                llm,
+                img,
+                renderer=renderer,
+                stub_missing=bool(getattr(args, "stub_missing_agents", False)),
+                stub_objective=args.stub_objective,
+            )
 
         async with TargetAPIClient.from_config(cfg.target_api, store=store) as api:
             orch = Orchestrator(
@@ -444,13 +491,14 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
             )
             final_snapshot = await orch.run(max_cycles=args.max_cycles)
 
+        return final_snapshot
+    finally:
+        if renderer is not None and hasattr(renderer, "__aexit__"):
+            await renderer.__aexit__(None, None, None)
         if llm is not None:
             await llm.aclose()
         if img is not None:
             await img.aclose()
-
-        return final_snapshot
-    finally:
         store.close()
 
 
@@ -471,6 +519,11 @@ def main() -> None:
         "--dry-run-stub-agents",
         action="store_true",
         help="Use deterministic stub agents (for offline mock-API verification)",
+    )
+    parser.add_argument(
+        "--stub-missing-agents",
+        action="store_true",
+        help="Fill any unmerged agent roles (e.g. Role 2) with stub fallbacks alongside real agents",
     )
     parser.add_argument(
         "--stub-objective",

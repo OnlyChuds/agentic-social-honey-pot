@@ -156,6 +156,9 @@ export function ActivityTabs({
       e.type === "target_event" &&
       ["link.opened", "page.submitted", "attachment.opened"].includes(String(e.payload.event || ""))
   );
+  const agentErrors = events.filter(
+    (e) => e.type === "system" && e.payload.kind === "agent_error"
+  );
 
   const filteredFacts = facts.filter((f) => {
     const q = factFilter.trim().toLowerCase();
@@ -401,27 +404,53 @@ export function ActivityTabs({
             </TabsContent>
 
             {/* Decisions */}
-            <TabsContent value="decisions" className="mt-0 divide-y divide-zinc-800/70">
-              {decisions.length === 0 ? (
-                <p className="py-6 text-center text-xs text-zinc-500">No decisions logged.</p>
-              ) : (
-                decisions.map((dec, idx) => (
-                  <div
-                    key={`${dec.ts}-${idx}`}
-                    onClick={() => onSelectVersion?.(dec.snapshot_version)}
-                    className="py-2.5 transition-colors hover:bg-zinc-900/40 cursor-pointer"
-                  >
-                    <div className="flex items-center justify-between gap-2 font-mono text-[11px] text-zinc-500">
-                      <span>
-                        v{dec.snapshot_version} · {dec.trigger} ·{" "}
-                        {dec.actions.map((a) => a.op).join(", ") || "noop"}
+            <TabsContent value="decisions" className="mt-0 space-y-3">
+              {agentErrors.length > 0 && (
+                <div className="space-y-1.5 rounded-lg border border-rose-900/60 bg-rose-950/20 p-3">
+                  <p className="font-mono text-[11px] font-medium text-rose-300">
+                    Agent / API Errors ({agentErrors.length})
+                  </p>
+                  {agentErrors.map((ev) => (
+                    <div
+                      key={ev.event_id}
+                      className="flex items-baseline justify-between gap-3 text-xs"
+                    >
+                      <span className="text-rose-200/90">
+                        <span className="font-mono text-rose-400">
+                          {String(ev.payload.failed_actor ?? ev.actor)}
+                        </span>
+                        : {String(ev.payload.error ?? "unknown error")}
                       </span>
-                      <span>{formatTimeShort(dec.ts)}</span>
+                      <span className="shrink-0 font-mono text-[10px] text-rose-400/70">
+                        {formatTimeShort(ev.ts)}
+                      </span>
                     </div>
-                    {dec.notes && <p className="mt-1 text-xs text-zinc-300">{dec.notes}</p>}
-                  </div>
-                ))
+                  ))}
+                </div>
               )}
+
+              <div className="divide-y divide-zinc-800/70">
+                {decisions.length === 0 ? (
+                  <p className="py-6 text-center text-xs text-zinc-500">No decisions logged.</p>
+                ) : (
+                  decisions.map((dec, idx) => (
+                    <div
+                      key={`${dec.ts}-${idx}`}
+                      onClick={() => onSelectVersion?.(dec.snapshot_version)}
+                      className="py-2.5 transition-colors hover:bg-zinc-900/40 cursor-pointer"
+                    >
+                      <div className="flex items-center justify-between gap-2 font-mono text-[11px] text-zinc-500">
+                        <span>
+                          v{dec.snapshot_version} · {dec.trigger} ·{" "}
+                          {dec.actions.map((a) => a.op).join(", ") || "noop"}
+                        </span>
+                        <span>{formatTimeShort(dec.ts)}</span>
+                      </div>
+                      {dec.notes && <p className="mt-1 text-xs text-zinc-300">{dec.notes}</p>}
+                    </div>
+                  ))
+                )}
+              </div>
             </TabsContent>
 
             {/* Facts */}

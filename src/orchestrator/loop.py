@@ -33,9 +33,23 @@ from src.orchestrator.wins import evaluate_wins
 
 SleepFn = Callable[[float], Awaitable[None]]
 
+_PHONE_CHANNELS: frozenset[str] = frozenset(
+    {"sms", "whatsapp", "signal", "imessage", "phone_call", "voicemail"}
+)
+_HARD_RULE_CRITERIA: frozenset[str] = frozenset({"domain_blocklist", "rule_compliance"})
+
 
 def _action(op: str, **extra: Any) -> DecisionAction:
     return DecisionAction.model_validate({"op": op, **extra})
+
+
+def _has_rule_violation(verdict: QAVerdict | None) -> bool:
+    if verdict is None or verdict.passed:
+        return False
+    return any(
+        issue.severity == "critical" and issue.criterion in _HARD_RULE_CRITERIA
+        for issue in verdict.issues
+    )
 
 
 @runtime_checkable
@@ -85,6 +99,7 @@ class Orchestrator:
         )
         self._active_conversations: dict[str, str] = {}
         self._consecutive_rejections: int = 0
+        self._last_signal_payload: dict[str, Any] | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -144,19 +159,47 @@ class Orchestrator:
 
         return target, default_touches, default_sessions
 
-    async def _upload_portrait_if_needed(self) -> None:
+    def _current_asset_map(self) -> dict[str, Path]:
+        mapping: dict[str, Path] = {}
+        for asset in self.state.store.list_assets():
+            local = Path(asset.local_path)
+            if local.is_file():
+                mapping[asset.asset_id] = local
+        return mapping
+
+    async def _upload_portrait_if_needed(self, identity_prop: Proposal | None = None) -> None:
         ident = self.snapshot.identity
-        if ident is None or ident.portrait.api_asset_id or not ident.portrait.local:
-            return
-        portrait_path = Path(ident.portrait.local)
-        if not portrait_path.is_file():
-            return
-        try:
-            record = await self.api.upload_asset(portrait_path)
-            ident.portrait.api_asset_id = record.asset_id
-            self.state.store.save_snapshot(self.snapshot)
-        except (AssetLimitError, TargetAPIError) as exc:
-            self.state.record_system_error("identity", f"Portrait upload skipped: {exc}")
+        if ident is not None and not ident.portrait.api_asset_id and ident.portrait.local:
+            portrait_path = Path(ident.portrait.local)
+            if portrait_path.is_file():
+                try:
+                    record = await self.api.upload_asset(portrait_path)
+                    ident.portrait.api_asset_id = record.asset_id
+                    self.state.store.save_snapshot(self.snapshot)
+                except (AssetLimitError, TargetAPIError) as exc:
+                    self.state.record_system_error("identity", f"Portrait upload skipped: {exc}")
+
+        if identity_prop is not None:
+            raw_generated = identity_prop.payload.get("generated_assets")
+            if isinstance(raw_generated, dict):
+                for asset_name, raw_path in raw_generated.items():
+                    path = Path(str(raw_path))
+                    if not path.is_file():
+                        continue
+                    try:
+                        record = await self.api.upload_asset(path)
+                        if (
+                            ident is not None
+                            and not ident.portrait.api_asset_id
+                            and asset_name == "master_portrait"
+                        ):
+                            ident.portrait.api_asset_id = record.asset_id
+                            self.state.store.save_snapshot(self.snapshot)
+                    except (AssetLimitError, TargetAPIError) as exc:
+                        self.state.record_system_error(
+                            "identity",
+                            f"Asset upload skipped for '{asset_name}': {exc}",
+                        )
 
     def _actions_from_commits(self, results: list[CommitResult]) -> list[DecisionAction]:
         actions: list[DecisionAction] = []
@@ -211,7 +254,7 @@ class Orchestrator:
         batch = [p for p in (osint_prop, identity_prop) if p is not None]
         if batch:
             actions.extend(self._actions_from_commits(self.state.commit_batch(batch)))
-        await self._upload_portrait_if_needed()
+        await self._upload_portrait_if_needed(identity_prop)
 
         # Profile synthesis
         profile_prop = await self._safe_run_agent("profile", self.agents.profile, mode="bootstrap")
@@ -270,15 +313,22 @@ class Orchestrator:
         channel: str,
         html_or_body: str,
         is_landing_page: bool,
-        revise_fn: Callable[[QAVerdict], Awaitable[str | None]],
-    ) -> tuple[str, QAVerdict | None]:
+        revise_fn: Callable[[QAVerdict, str], Awaitable[str | None]],
+        page_url: str | None = None,
+        expected_url: str | None = None,
+        landing_page_spec: dict[str, Any] | None = None,
+        render_prefix: str = "artifact",
+    ) -> tuple[str, QAVerdict | None, bool]:
         if self.agents.qa is None:
-            return html_or_body, None
+            return html_or_body, None, False
 
         current_content = html_or_body
         last_verdict: QAVerdict | None = None
+        asset_map = self._current_asset_map()
+        renders_dir = self.config.run.data_dir / "renders"
 
         for revision in range(self.policy.max_revisions + 1):
+            screenshot_path = renders_dir / f"{render_prefix}_r{revision}.png"
             qa_prop = await self._safe_run_agent(
                 "qa",
                 self.agents.qa,
@@ -286,33 +336,46 @@ class Orchestrator:
                 html=current_content,
                 is_landing_page=is_landing_page,
                 revision=revision,
+                revision_cycle=revision,
+                asset_map=asset_map or None,
+                page_url=page_url,
+                expected_url=expected_url,
+                landing_page_spec=landing_page_spec,
+                save_screenshot_path=screenshot_path,
             )
             if qa_prop is None:
-                return current_content, last_verdict
+                return current_content, last_verdict, False
             try:
                 verdict = QAVerdict.model_validate(qa_prop.payload)
             except Exception as exc:  # noqa: BLE001
                 self.state.record_system_error("qa", f"Invalid QAVerdict payload: {exc}")
-                return current_content, last_verdict
+                return current_content, last_verdict, False
 
             last_verdict = verdict
             self.state.commit_proposal(qa_prop)
             if verdict.passed:
-                return current_content, verdict
+                return current_content, verdict, False
             if revision >= self.policy.max_revisions:
+                if _has_rule_violation(verdict):
+                    self.state.record_system_error(
+                        "qa",
+                        "QA blocked artifact due to critical rule compliance / domain violation",
+                        context={"required_fixes": verdict.required_fixes},
+                    )
+                    return current_content, verdict, True
                 self.state.record_system_error(
                     "qa",
                     "QA max revisions reached; shipping with logged warning",
                     context={"required_fixes": verdict.required_fixes},
                 )
-                return current_content, verdict
+                return current_content, verdict, False
 
-            revised = await revise_fn(verdict)
+            revised = await revise_fn(verdict, current_content)
             if not revised:
-                return current_content, verdict
+                return current_content, verdict, _has_rule_violation(verdict)
             current_content = revised
 
-        return current_content, last_verdict
+        return current_content, last_verdict, _has_rule_violation(last_verdict)
 
     async def _ensure_landing_page_registered(
         self,
@@ -354,15 +417,16 @@ class Orchestrator:
                     if isinstance(page_html_block.get("fields"), list) and page_html_block["fields"]:
                         fields = [str(f) for f in page_html_block["fields"]]
 
-        async def _revise_page(verdict: QAVerdict) -> str | None:
+        async def _revise_page(verdict: QAVerdict, previous_html: str) -> str | None:
             if self.agents.identity is None:
                 return None
             rev_prop = await self._safe_run_agent(
                 "identity",
                 self.agents.identity,
-                mode="landing_page",
+                mode="revise",
                 landing_page_spec=spec.model_dump(mode="json"),
                 qa_feedback=verdict.model_dump(mode="json", by_alias=True),
+                previous_html=previous_html,
             )
             if rev_prop is None:
                 return None
@@ -371,12 +435,23 @@ class Orchestrator:
                 return str(block["html"])
             return None
 
-        html, _ = await self._run_qa_gate(
+        html, page_verdict, blocked_by_rule = await self._run_qa_gate(
             channel="landing_page",
             html_or_body=html,
             is_landing_page=True,
             revise_fn=_revise_page,
+            page_url=page_url,
+            landing_page_spec=spec.model_dump(mode="json"),
+            render_prefix=f"{session_id}_page_t{next_touch_n}",
         )
+        if blocked_by_rule:
+            reason = (
+                "; ".join(page_verdict.required_fixes)
+                if page_verdict and page_verdict.required_fixes
+                else "landing page failed rule compliance QA"
+            )
+            actions.append(_action("reject", proposal_id="landing_page", reason=reason))
+            return None
 
         await self.api.register_page(
             session_id,
@@ -388,15 +463,32 @@ class Orchestrator:
         actions.append(_action("register_page", url=page_url, title=title, fields=fields))
         return page_url
 
-    def _sender_dict(self) -> dict[str, str] | None:
+    def _sender_dict(
+        self,
+        *,
+        channel: str = "email",
+        msg_payload: dict[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        if msg_payload is not None:
+            raw_from = msg_payload.get("from_sender") or msg_payload.get("from")
+            if isinstance(raw_from, dict):
+                sender_out: dict[str, str] = {}
+                if raw_from.get("name"):
+                    sender_out["name"] = str(raw_from["name"])
+                if raw_from.get("address"):
+                    sender_out["address"] = str(raw_from["address"])
+                if sender_out:
+                    return sender_out
+
         ident = self.snapshot.identity
         if ident is None:
             return None
         sender: dict[str, str] = {}
         if ident.sender_name:
             sender["name"] = ident.sender_name
-        if ident.email:
-            sender["address"] = ident.email
+        address = ident.phone if channel in _PHONE_CHANNELS and ident.phone else ident.email
+        if address:
+            sender["address"] = address
         return sender or None
 
     async def _close_active_conversations(self) -> None:
@@ -430,6 +522,7 @@ class Orchestrator:
             return False
 
         self.policy.reset_for_new_session()
+        self._last_signal_payload = None
         self.state.start_session(new_sid)
         actions.append(
             _action(
@@ -490,13 +583,16 @@ class Orchestrator:
         touch_spec = self._next_touch_spec()
         registered_url = await self._ensure_landing_page_registered(touch_spec.n, actions)
 
-        # Compose message
+        # Compose message (use live_turn mode for live voice/chat channels)
+        compose_mode = "live_turn" if self.policy.is_live_channel(touch_spec.channel) else "compose"
         msg_prop = await self._safe_run_agent(
             "messaging",
             self.agents.messaging,
-            mode="compose",
+            mode=compose_mode,
+            channel=touch_spec.channel,
             touch=touch_spec.model_dump(mode="json"),
             registered_page_url=registered_url,
+            latest_signal=self._last_signal_payload,
         )
         if msg_prop is None:
             self.state.transition_state("ABORT", reason="messaging agent unavailable")
@@ -512,27 +608,55 @@ class Orchestrator:
 
         # QA gate for visual emails
         raw_channel = str(msg_prop.payload.get("channel") or touch_spec.channel)
-        body = str(msg_prop.payload.get("body") or "")
+        body = str(msg_prop.payload.get("say") or msg_prop.payload.get("body") or "")
         if self.policy.needs_qa(raw_channel, body, is_landing_page=False):
-            async def _revise_msg(verdict: QAVerdict) -> str | None:
+            async def _revise_msg(verdict: QAVerdict, _prev: str) -> str | None:
                 rev = await self._safe_run_agent(
                     "messaging",
                     self.agents.messaging,
                     mode="compose",
                     touch=touch_spec.model_dump(mode="json"),
                     registered_page_url=registered_url,
+                    latest_signal=self._last_signal_payload,
                     qa_feedback=verdict.model_dump(mode="json", by_alias=True),
                 )
                 if rev is None:
                     return None
                 return str(rev.payload.get("body") or "")
 
-            revised_body, _ = await self._run_qa_gate(
+            revised_body, msg_verdict, blocked_by_rule = await self._run_qa_gate(
                 channel=raw_channel,
                 html_or_body=body,
                 is_landing_page=False,
                 revise_fn=_revise_msg,
+                expected_url=registered_url,
+                render_prefix=f"{session_id}_t{touch_spec.n}",
             )
+            if blocked_by_rule:
+                reason = (
+                    "; ".join(msg_verdict.required_fixes)
+                    if msg_verdict and msg_verdict.required_fixes
+                    else "email failed rule compliance QA"
+                )
+                self._consecutive_rejections += 1
+                actions.append(
+                    _action("reject", proposal_id=msg_prop.proposal_id, reason=reason)
+                )
+                if self._consecutive_rejections >= 3:
+                    await self._close_active_conversations()
+                    self.state.transition_state(
+                        "ABORT",
+                        reason=f"3 consecutive rule-blocked messages: {reason}",
+                    )
+                self.state.log_decision(
+                    DecisionRecord(
+                        trigger="agent_output",
+                        snapshot_version=self.snapshot.version,
+                        actions=actions,
+                        notes=f"QA blocked outbound email for rule compliance: {reason}",
+                    )
+                )
+                return self.snapshot
             msg_prop.payload["body"] = revised_body
             msg_prop.base_version = self.snapshot.version
 
@@ -549,9 +673,11 @@ class Orchestrator:
             retry_prop = await self._safe_run_agent(
                 "messaging",
                 self.agents.messaging,
-                mode="compose",
+                mode=compose_mode,
+                channel=touch_spec.channel,
                 touch=touch_spec.model_dump(mode="json"),
                 registered_page_url=registered_url,
+                latest_signal=self._last_signal_payload,
                 rejection_feedback=reject_reason,
             )
             if retry_prop is not None:
@@ -585,10 +711,13 @@ class Orchestrator:
 
         self._consecutive_rejections = 0
         channel: Channel = raw_channel if raw_channel in VALID_CHANNELS else "email"  # type: ignore[assignment]
-        body = str(msg_prop.payload["body"])
+        body = str(msg_prop.payload.get("say") or msg_prop.payload["body"])
         subject_raw = msg_prop.payload.get("subject")
         subject = str(subject_raw) if subject_raw is not None else None
         attachments = msg_prop.payload.get("attachments") or None
+        sent_at_raw = msg_prop.payload.get("sent_at")
+        sent_at = str(sent_at_raw) if sent_at_raw else None
+        sender_obj = self._sender_dict(channel=channel, msg_payload=msg_prop.payload)
         facts_used = [str(f) for f in msg_prop.payload.get("facts_used", [])]
         page_request = msg_prop.payload.get("page_request")
         required_page_url = (
@@ -613,7 +742,8 @@ class Orchestrator:
                         session_id,
                         to=self.snapshot.target.id,
                         channel=channel,
-                        sender=self._sender_dict(),
+                        sender=sender_obj,
+                        sent_at=sent_at,
                         idempotency_key=idempotency_key,
                     )
                     cid = str(conv_res.get("conversation_id") or conv_res.get("id") or "")
@@ -623,6 +753,8 @@ class Orchestrator:
                 api_res = await self.api.send_conversation_turn(
                     cid,
                     body,
+                    attachments=attachments,
+                    sent_at=sent_at,
                     idempotency_key=str(uuid4()),
                 )
             else:
@@ -631,9 +763,10 @@ class Orchestrator:
                     to=self.snapshot.target.id,
                     channel=channel,
                     body=body,
-                    sender=self._sender_dict(),
+                    sender=sender_obj,
                     subject=subject,
                     attachments=attachments,
+                    sent_at=sent_at,
                     required_page_url=required_page_url,
                     idempotency_key=idempotency_key,
                 )
@@ -766,6 +899,7 @@ class Orchestrator:
                 )
                 if sig_prop is not None:
                     self.state.commit_proposal(sig_prop)
+                    self._last_signal_payload = dict(sig_prop.payload)
                     engagement = float(sig_prop.payload.get("engagement", 0.5))
                     suspicion = float(sig_prop.payload.get("suspicion", 0.0))
                     self.policy.record_signal(engagement=engagement, suspicion=suspicion)

@@ -318,6 +318,7 @@ class TargetAPIClient:
         sender: dict[str, str] | None = None,
         subject: str | None = None,
         attachments: list[str | dict[str, Any]] | None = None,
+        sent_at: str | None = None,
         required_page_url: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -340,6 +341,8 @@ class TargetAPIClient:
             payload["subject"] = subject
         if attachments:
             payload["attachments"] = attachments
+        if sent_at is not None:
+            payload["sent_at"] = sent_at
 
         res = await self._request(
             "POST",
@@ -480,6 +483,7 @@ class TargetAPIClient:
         to: str,
         channel: str,
         sender: dict[str, str] | None = None,
+        sent_at: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -488,6 +492,8 @@ class TargetAPIClient:
         }
         if sender:
             payload["from"] = sender
+        if sent_at is not None:
+            payload["sent_at"] = sent_at
         res = await self._request(
             "POST",
             f"/sessions/{session_id}/conversations",
@@ -502,16 +508,23 @@ class TargetAPIClient:
         conversation_id: str,
         say: str,
         *,
+        attachments: list[str | dict[str, Any]] | None = None,
+        sent_at: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if len(say) > MAX_TURN_CHARS:
             raise ValueError(
                 f"Conversation turn 'say' length ({len(say)}) exceeds {MAX_TURN_CHARS} char limit"
             )
+        payload: dict[str, Any] = {"say": say}
+        if attachments:
+            payload["attachments"] = attachments
+        if sent_at is not None:
+            payload["sent_at"] = sent_at
         res = await self._request(
             "POST",
             f"/conversations/{conversation_id}/turns",
-            json_body={"say": say},
+            json_body=payload,
             mutating=True,
             idempotency_key=idempotency_key,
         )
