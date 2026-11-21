@@ -129,35 +129,57 @@ class TextLLMClient:
                 kwargs["tool_choice"] = tool_choice
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
 
-        resp = await self._client.chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        msg = choice.message
-        raw_tool_calls: list[dict[str, Any]] = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    raw_tool_calls.append(
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": fn.name,
-                                "arguments": fn.arguments,
-                            },
-                        }
+        stream = await self._client.chat.completions.create(**kwargs)
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tc_acc: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        async for chunk in stream:
+            if chunk.usage is not None:
+                prompt_tokens = chunk.usage.prompt_tokens
+                completion_tokens = chunk.usage.completion_tokens
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason is not None:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta.content:
+                content_parts.append(delta.content)
+            r_chunk = getattr(delta, "reasoning", None) or getattr(
+                delta, "reasoning_content", None
+            )
+            if isinstance(r_chunk, str) and r_chunk:
+                reasoning_parts.append(r_chunk)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    slot = tc_acc.setdefault(
+                        idx,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                     )
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function is not None:
+                        if tc.function.name:
+                            slot["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            slot["function"]["arguments"] += tc.function.arguments
 
-        reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
-        usage = resp.usage
+        raw_tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
         return TextCompletion(
-            content=msg.content or "",
-            reasoning=reasoning if isinstance(reasoning, str) else None,
+            content="".join(content_parts),
+            reasoning="".join(reasoning_parts) or None,
             tool_calls=raw_tool_calls,
-            finish_reason=choice.finish_reason,
-            prompt_tokens=usage.prompt_tokens if usage else 0,
-            completion_tokens=usage.completion_tokens if usage else 0,
+            finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
     async def complete_json(
