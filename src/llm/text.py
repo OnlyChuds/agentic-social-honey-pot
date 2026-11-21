@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -7,11 +8,26 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Self, TypeVar, cast
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+)
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from pydantic import BaseModel, ValidationError
 
 from src.config import ModelEndpointConfig
+
+_TRANSIENT_LLM_ERRORS = (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+)
 
 T = TypeVar("T", bound=BaseModel)
 ToolHandler = Callable[[dict[str, Any]], Any | Awaitable[Any]]
@@ -183,55 +199,67 @@ class TextLLMClient:
             json_mode=json_mode,
         )
 
-        stream = await self._client.chat.completions.create(**kwargs)
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tc_acc: dict[int, dict[str, Any]] = {}
-        finish_reason: str | None = None
-        prompt_tokens = 0
-        completion_tokens = 0
+        backoff_delays = (1.5, 3.5)
+        for attempt in range(len(backoff_delays) + 1):
+            try:
+                stream = await self._client.chat.completions.create(**kwargs)
+                content_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                tc_acc: dict[int, dict[str, Any]] = {}
+                finish_reason: str | None = None
+                prompt_tokens = 0
+                completion_tokens = 0
 
-        async for chunk in stream:
-            if chunk.usage is not None:
-                prompt_tokens = chunk.usage.prompt_tokens
-                completion_tokens = chunk.usage.completion_tokens
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.finish_reason is not None:
-                finish_reason = choice.finish_reason
-            delta = choice.delta
-            if delta.content:
-                content_parts.append(delta.content)
-            r_chunk = getattr(delta, "reasoning", None) or getattr(
-                delta, "reasoning_content", None
-            )
-            if isinstance(r_chunk, str) and r_chunk:
-                reasoning_parts.append(r_chunk)
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    slot = tc_acc.setdefault(
-                        idx,
-                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                async for chunk in stream:
+                    if chunk.usage is not None:
+                        prompt_tokens = chunk.usage.prompt_tokens
+                        completion_tokens = chunk.usage.completion_tokens
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    if choice.finish_reason is not None:
+                        finish_reason = choice.finish_reason
+                    delta = choice.delta
+                    if delta.content:
+                        content_parts.append(delta.content)
+                    r_chunk = getattr(delta, "reasoning", None) or getattr(
+                        delta, "reasoning_content", None
                     )
-                    if tc.id:
-                        slot["id"] = tc.id
-                    if tc.function is not None:
-                        if tc.function.name:
-                            slot["function"]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            slot["function"]["arguments"] += tc.function.arguments
+                    if isinstance(r_chunk, str) and r_chunk:
+                        reasoning_parts.append(r_chunk)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            slot = tc_acc.setdefault(
+                                idx,
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tc.id:
+                                slot["id"] = tc.id
+                            if tc.function is not None:
+                                if tc.function.name:
+                                    slot["function"]["name"] += tc.function.name
+                                if tc.function.arguments:
+                                    slot["function"]["arguments"] += tc.function.arguments
 
-        raw_tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
-        return TextCompletion(
-            content="".join(content_parts),
-            reasoning="".join(reasoning_parts) or None,
-            tool_calls=raw_tool_calls,
-            finish_reason=finish_reason,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
+                raw_tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
+                return TextCompletion(
+                    content="".join(content_parts),
+                    reasoning="".join(reasoning_parts) or None,
+                    tool_calls=raw_tool_calls,
+                    finish_reason=finish_reason,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            except _TRANSIENT_LLM_ERRORS:
+                if attempt >= len(backoff_delays):
+                    raise
+                await asyncio.sleep(backoff_delays[attempt])
+        raise RuntimeError("unreachable")
 
     async def complete_json(
         self,

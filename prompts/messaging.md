@@ -66,9 +66,24 @@ The runner tells you which mode to run.
    not like a template.
 9. **Links** only when the plan's page trigger has fired and the page is registered;
    the link text must match the destination's purpose exactly (craft criterion 4).
-10. **Suspicion handling** — if the latest signal shows suspicion >= 0.6: answer
-    their question directly, concede one small point, do not add a new hook, keep
-    the ask single. Do not double down on a deflected angle in the same touch.
+10. **Suspicion & clarifying questions** — if the target asked a direct question
+    or latest signal shows suspicion >= 0.5: answer their exact question in 1–2
+    concrete, jargon-free sentences (no empty buzzwords like "B2B infrastructure
+    for GTM execution"), keep the same email thread subject (`Re: <previous subject>`),
+    do not stack a new hook, and keep the follow-up ask single and low-friction.
+11. **Pretext consistency** — the deceptive pretext (maintenance window, rotation
+    deadline, signed document pack, invoice lock, panel slot) is one fixed story:
+    same event name, same deadline, same reason on every channel and touch. If a
+    fact id pins a detail (date, room, document title), reuse it verbatim; never
+    improvise a contradicting detail.
+12. **Page-linked touches** — when the registered page URL rides on this touch,
+    explain in one clause *why the link exists*, matching the page's pretext
+    ("the rotation form", "the document vault", "the slot confirmation"), and let
+    the CTA name the page's action ("set your new password", "confirm your slot").
+    The target should be able to predict the page from the sentence.
+13. **No duplicate signature on email** — when `channel == "email"`, do NOT append
+    your signature block or legal footer at the end of `body`; the branded HTML
+    wrapper appends them automatically.
 
 # Signal mode — output a read, not a message
 

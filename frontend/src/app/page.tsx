@@ -21,6 +21,7 @@ export default function DashboardPage() {
   const [isLivePinned, setIsLivePinned] = useState<boolean>(true);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [offlineReplaysAvailable, setOfflineReplaysAvailable] = useState<boolean | null>(null);
   const [stopping, setStopping] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,6 +32,7 @@ export default function DashboardPage() {
     try {
       const res = await fetchTargets();
       setTargets(res.targets);
+      setOfflineReplaysAvailable(res.offline_replays_available === true);
       setError(null);
 
       const desired = preferredRunId ?? selectedRunIdRef.current;
@@ -246,6 +248,8 @@ export default function DashboardPage() {
           if (selectedRunId) void loadDetail(selectedRunId);
         }}
         onLaunched={handleLaunched}
+        offlineReplaysAvailable={offlineReplaysAvailable}
+        onReplayCreated={(runId) => void loadTargets(runId)}
         isConnected={isConnected}
         isLoading={isLoading}
       />
@@ -265,7 +269,8 @@ export default function DashboardPage() {
               {isLoading ? "Loading campaigns..." : "No target campaign selected"}
             </h2>
             <p className="mt-1 max-w-md text-xs text-zinc-500">
-              Click Launch Practice Run in the sidebar or seed sample campaigns:
+              Choose an existing run or use the sidebar to create one. You can also seed sample
+              replays:
             </p>
             <code className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-300">
               uv run python -m src.web.demo_seed --data-dir data

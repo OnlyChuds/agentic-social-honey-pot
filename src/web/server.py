@@ -14,11 +14,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from src.models import utc_now_iso
 from src.store.db import Store
 from src.web.demo_seed import seed_demo_data
+from src.web.offline_replay import write_acknowledgment_replay
 from src.web.queries import get_snapshot_at_version, get_target_detail, list_targets
 from src.web.runner import RunManager
 
@@ -33,6 +34,12 @@ class LaunchRunRequest(BaseModel):
     zero_pacing: bool = True
     aggressive: bool = False
     scenario: str = "practice"
+
+
+class OfflineReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fixture: Literal["acknowledgment"]
 
 
 def _resolve_db_path(data_dir: Path, run_id: str) -> Path:
@@ -62,8 +69,7 @@ def _compute_stream_fingerprint(
                 except OSError:
                     continue
     runs_state = tuple(
-        (str(r["run_id"]), str(r["status"]), r["returncode"])
-        for r in run_manager.list_runs()
+        (str(r["run_id"]), str(r["status"]), r["returncode"]) for r in run_manager.list_runs()
     )
     return (tuple(files_state), runs_state)
 
@@ -82,6 +88,8 @@ def _db_fingerprint(db_path: Path, *, is_running: bool) -> tuple[Any, ...]:
 def create_app(
     data_dir: Path,
     run_manager: RunManager | None = None,
+    *,
+    viewer_mode: bool = False,
 ) -> FastAPI:
     """Create the Target Intelligence & Campaign Monitor FastAPI application."""
     resolved_dir = Path(data_dir)
@@ -105,7 +113,9 @@ def create_app(
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+        allow_origins=[]
+        if viewer_mode
+        else ["http://localhost:3000", "http://127.0.0.1:3000", "*"],
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -120,6 +130,8 @@ def create_app(
         if targets_cache["fp"] == fp and targets_cache["data"] is not None:
             return dict(targets_cache["data"])
         data = list_targets(resolved_dir, running_run_ids=manager.running_ids())
+        if viewer_mode:
+            data["offline_replays_available"] = True
         targets_cache["fp"] = fp
         targets_cache["data"] = data
         return data
@@ -168,7 +180,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Asset file missing on disk: {asset_id}")
         return FileResponse(path=local_file, media_type=asset.content_type)
 
-    @app.post("/api/runs/launch")
     async def api_launch_run(req: LaunchRunRequest) -> dict[str, Any]:
         if req.scenario != "practice":
             raise HTTPException(
@@ -191,12 +202,20 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return info.to_dict()
 
-    @app.post("/api/runs/{run_id}/stop")
     async def api_stop_run(run_id: str) -> dict[str, Any]:
         if not RUN_ID_RE.match(run_id):
             raise HTTPException(status_code=400, detail=f"Invalid run_id: {run_id!r}")
         stopped = manager.stop(run_id)
         return {"run_id": run_id, "stopped": stopped}
+
+    def api_create_offline_replay(_request: OfflineReplayRequest) -> dict[str, str]:
+        return {"run_id": write_acknowledgment_replay(resolved_dir)}
+
+    if viewer_mode:
+        app.post("/api/offline-replays", status_code=201)(api_create_offline_replay)
+    else:
+        app.post("/api/runs/launch")(api_launch_run)
+        app.post("/api/runs/{run_id}/stop")(api_stop_run)
 
     @app.get("/api/runs/active")
     async def api_active_runs() -> dict[str, Any]:
@@ -246,9 +265,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the Target Intelligence & Campaign Monitor FastAPI backend."
     )
-    parser.add_argument("--data-dir", default="data", help="Directory containing campaign *.db files")
+    parser.add_argument(
+        "--data-dir", default="data", help="Directory containing campaign *.db files"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help="View saved runs and create canned offline replays without campaign controls",
+    )
     parser.add_argument(
         "--seed-demo",
         action="store_true",
@@ -265,7 +291,7 @@ def main() -> None:
     if args.seed_demo:
         seed_demo_data(data_dir)
 
-    app = create_app(data_dir)
+    app = create_app(data_dir, viewer_mode=args.viewer)
     uvicorn.run(app, host=args.host, port=args.port, access_log=args.access_log)
 
 

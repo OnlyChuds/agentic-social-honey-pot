@@ -1,51 +1,63 @@
 import type {
   LaunchRunRequest,
   LaunchRunResponse,
+  SnapshotJSON,
   TargetDetailResponse,
   TargetListResponse,
 } from "@/lib/types";
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
-    cache: "no-store",
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
+    cache: "no-store",
   });
   if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
+    let detail = res.statusText;
     try {
-      const body = (await res.json()) as { detail?: string };
-      if (body?.detail) detail = body.detail;
+      const body = await res.json();
+      if (body && typeof body.detail === "string") {
+        detail = body.detail;
+      }
     } catch {
-      // ignore parse failure
+      // ignore non-JSON body
     }
-    throw new Error(detail);
+    throw new Error(`HTTP ${res.status}: ${detail}`);
   }
   return (await res.json()) as T;
 }
 
 export function fetchTargets(): Promise<TargetListResponse> {
-  return requestJson<TargetListResponse>("/api/targets");
+  return fetchJson<TargetListResponse>("/api/targets");
 }
 
-export function fetchTargetDetail(runId: string): Promise<TargetDetailResponse> {
-  return requestJson<TargetDetailResponse>(`/api/targets/${encodeURIComponent(runId)}`);
-}
-
-export function launchPracticeRun(req: LaunchRunRequest): Promise<LaunchRunResponse> {
-  return requestJson<LaunchRunResponse>("/api/runs/launch", {
+export function createOfflineReplay(): Promise<{ run_id: string }> {
+  return fetchJson<{ run_id: string }>("/api/offline-replays", {
     method: "POST",
-    body: JSON.stringify({ scenario: "practice", ...req }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fixture: "acknowledgment" }),
   });
 }
 
-export function stopPracticeRun(
-  runId: string
-): Promise<{ run_id: string; stopped: boolean }> {
-  return requestJson<{ run_id: string; stopped: boolean }>(
+export function fetchTargetDetail(runId: string): Promise<TargetDetailResponse> {
+  return fetchJson<TargetDetailResponse>(`/api/targets/${encodeURIComponent(runId)}`);
+}
+
+export function fetchSnapshotAtVersion(runId: string, version: number): Promise<SnapshotJSON> {
+  return fetchJson<SnapshotJSON>(
+    `/api/targets/${encodeURIComponent(runId)}/snapshot/${version}`
+  );
+}
+
+export function launchPracticeRun(req: LaunchRunRequest): Promise<LaunchRunResponse> {
+  return fetchJson<LaunchRunResponse>("/api/runs/launch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, scenario: "practice" }),
+  });
+}
+
+export function stopPracticeRun(runId: string): Promise<{ run_id: string; status: string }> {
+  return fetchJson<{ run_id: string; status: string }>(
     `/api/runs/${encodeURIComponent(runId)}/stop`,
     { method: "POST" }
   );

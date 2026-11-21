@@ -1,10 +1,11 @@
 "use client";
 
-import { RefreshCw } from "lucide-react";
+import { Play, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { LaunchPracticeDialog } from "@/components/dashboard/LaunchPracticeDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { createOfflineReplay } from "@/lib/api";
 import type { LaunchRunResponse, TargetSummary } from "@/lib/types";
 import { cn, formatScore, getStageTextClass, getSuspicionBand } from "@/lib/utils";
 
@@ -14,6 +15,8 @@ interface TargetSidebarProps {
   onSelect: (runId: string) => void;
   onRefresh: () => void;
   onLaunched: (res: LaunchRunResponse) => void;
+  offlineReplaysAvailable: boolean | null;
+  onReplayCreated: (runId: string) => void;
   isConnected: boolean;
   isLoading: boolean;
 }
@@ -24,10 +27,27 @@ export function TargetSidebar({
   onSelect,
   onRefresh,
   onLaunched,
+  offlineReplaysAvailable,
+  onReplayCreated,
   isConnected,
   isLoading,
 }: TargetSidebarProps) {
   const [search, setSearch] = useState("");
+  const [creatingReplay, setCreatingReplay] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+
+  async function handleCreateReplay() {
+    setCreatingReplay(true);
+    setReplayError(null);
+    try {
+      const { run_id } = await createOfflineReplay();
+      onReplayCreated(run_id);
+    } catch (err) {
+      setReplayError(err instanceof Error ? err.message : "Could not create offline replay.");
+    } finally {
+      setCreatingReplay(false);
+    }
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -62,7 +82,25 @@ export function TargetSidebar({
           </Button>
         </div>
 
-        <LaunchPracticeDialog onLaunched={onLaunched} />
+        {offlineReplaysAvailable === true && (
+          <>
+            <Button
+              className="w-full justify-center gap-1.5 font-medium"
+              onClick={() => void handleCreateReplay()}
+              disabled={creatingReplay}
+            >
+              <Play className="h-3 w-3 fill-current" />
+              {creatingReplay ? "Creating replay…" : "Run Offline Replay"}
+            </Button>
+            <p className="text-[11px] text-zinc-500">Canned test data. No external API calls.</p>
+            {replayError && (
+              <p role="alert" className="text-xs text-rose-400">
+                {replayError}
+              </p>
+            )}
+          </>
+        )}
+        {offlineReplaysAvailable === false && <LaunchPracticeDialog onLaunched={onLaunched} />}
 
         <Input
           value={search}

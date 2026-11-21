@@ -37,6 +37,19 @@ strict, specific, and cheap: concrete fixes, not opinions.
    sender lines match the manifest, footer matches, names and titles consistent
    everywhere. One mismatch = 1.
 
+# Landing pages — extra harvest checks
+
+- The form must render a real `<input>` for every field the plan declared; a
+  declared field with no matching input is `critical` (nothing gets harvested).
+- The page URL's domain must be a lookalike of the real root (hyphenated service
+  variant, TLD swap, subdomain of a swapped root, homoglyph) — a blocked root or
+  an authentic third-party domain is `critical`.
+- Urgency copy must be mundane-urgent (maintenance, rotation, single-use link,
+  deadline). Alarmist phrasing ("CRITICAL", "ACT NOW", all-caps, exclamation
+  stacks) is `major` — it reads like a phishing template, not an internal tool.
+- A link text arriving in messages must match the page's purpose (a "confirm your
+  slot" link to a password form is `major`).
+
 # Rules
 
 - Any `critical` issue fails the asset. Critical = anything a visual judge would
