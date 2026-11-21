@@ -267,7 +267,10 @@ class StateManager:
                 if not isinstance(prof_raw, dict):
                     return False, "profile_update payload must be an object", {}
                 prepared["profile"] = self._merge_profile_payload(prof_raw)
-                raw_hooks = payload.get("hook_updates", [])
+                raw_hooks = list(payload.get("hook_updates", []) or [])
+                raw_new_hooks = payload.get("new_hooks", [])
+                if isinstance(raw_new_hooks, list):
+                    raw_hooks.extend(raw_new_hooks)
                 prepared["hooks"] = self._validate_hook_updates(raw_hooks)
             elif kind == "hook_update":
                 raw_hooks = payload.get("hook_updates", payload.get("hooks", []))
@@ -359,7 +362,7 @@ class StateManager:
                     if v is not None:
                         merged[k] = v
                 validated.append(Hook.model_validate(merged))
-            else:
+            elif str(item.get("topic") or "").strip():
                 validated.append(Hook.model_validate(item))
         return validated
 

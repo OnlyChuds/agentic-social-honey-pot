@@ -58,36 +58,66 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // Initial fetch + SSE live stream with 2.5s polling fallback
+  // Initial fetch + SSE live stream (debounced updates; fallback poll only if SSE disconnects)
   useEffect(() => {
     void loadTargets();
 
     let es: EventSource | null = null;
-    try {
-      es = new EventSource("/api/stream");
-      es.onopen = () => setIsConnected(true);
-      es.onmessage = () => {
+    let sseOpen = false;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleRefresh = () => {
+      if (debounceTimer) return;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        if (document.hidden) return;
         void loadTargets();
         if (selectedRunIdRef.current) {
           void loadDetail(selectedRunIdRef.current);
         }
+      }, 300);
+    };
+
+    try {
+      es = new EventSource("/api/stream");
+      es.onopen = () => {
+        sseOpen = true;
+        setIsConnected(true);
+      };
+      es.onmessage = (evt) => {
+        try {
+          const parsed = JSON.parse(evt.data) as { type?: string };
+          if (parsed.type === "connected") return;
+        } catch {
+          // treat non-JSON messages as update notifications
+        }
+        scheduleRefresh();
       };
       es.onerror = () => {
+        sseOpen = false;
         setIsConnected(false);
       };
     } catch {
+      sseOpen = false;
       setIsConnected(false);
     }
 
     const poll = setInterval(() => {
-      void loadTargets();
-      if (selectedRunIdRef.current) {
-        void loadDetail(selectedRunIdRef.current);
+      if (sseOpen || document.hidden) return;
+      scheduleRefresh();
+    }, 8000);
+
+    const onVisibility = () => {
+      if (!document.hidden) {
+        scheduleRefresh();
       }
-    }, 2500);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       clearInterval(poll);
+      document.removeEventListener("visibilitychange", onVisibility);
       es?.close();
     };
   }, [loadTargets, loadDetail]);

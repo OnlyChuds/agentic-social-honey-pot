@@ -257,7 +257,17 @@ class Orchestrator:
         await self._upload_portrait_if_needed(identity_prop)
 
         # Profile synthesis
-        profile_prop = await self._safe_run_agent("profile", self.agents.profile, mode="bootstrap")
+        psych_seeds = (
+            osint_prop.payload.get("psychoprofile")
+            if osint_prop is not None and isinstance(osint_prop.payload.get("psychoprofile"), list)
+            else None
+        )
+        profile_prop = await self._safe_run_agent(
+            "profile",
+            self.agents.profile,
+            mode="bootstrap",
+            psychoprofile_seeds=psych_seeds,
+        )
         if profile_prop is not None:
             actions.extend(self._actions_from_commits([self.state.commit_proposal(profile_prop)]))
             self.policy.mark_profile_ran()
@@ -918,11 +928,16 @@ class Orchestrator:
                 self.agents.profile,
                 mode="update",
                 recent_events=[e.model_dump(mode="json") for e in recorded_events],
+                recent_signals=(
+                    [self._last_signal_payload] if self._last_signal_payload is not None else None
+                ),
             )
             if prof_prop is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(prof_prop)]))
                 self.policy.mark_profile_ran()
-                raw_disc = prof_prop.payload.get("disclosure_candidates")
+                raw_disc = prof_prop.payload.get("disclosure_candidates") or prof_prop.payload.get(
+                    "disclosures"
+                )
                 if isinstance(raw_disc, list):
                     disclosure_candidates = [d for d in raw_disc if isinstance(d, dict)]
 

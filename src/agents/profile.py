@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from src.agents.base import BaseAgent
+from src.agents.messaging import _compact_conversation_for_llm
 from src.models import (
     Actor,
     Hook,
@@ -90,16 +91,21 @@ class ProfileAgent(BaseAgent):
     ) -> Proposal:
         del mode
         active_facts = [f.model_dump(mode="json") for f in snapshot.facts if f.status == "active"]
+        normalized_seeds: list[dict[str, Any]] = []
+        for s in psychoprofile_seeds or []:
+            if isinstance(s, PsychTrait):
+                normalized_seeds.append(s.model_dump(mode="json"))
+            elif isinstance(s, dict):
+                normalized_seeds.append(s)
+
         context: dict[str, Any] = {
             "target": snapshot.target.model_dump(mode="json"),
             "scenario": snapshot.run.scenario,
             "active_facts": active_facts,
             "current_hooks": [h.model_dump(mode="json") for h in snapshot.hooks],
             "current_profile": snapshot.profile.model_dump(mode="json"),
-            "psychoprofile_seeds": [
-                s.model_dump(mode="json") for s in (psychoprofile_seeds or [])
-            ],
-            "recent_conversation": [t.model_dump(mode="json") for t in snapshot.conversation.turns],
+            "psychoprofile_seeds": normalized_seeds,
+            "recent_conversation": _compact_conversation_for_llm(snapshot),
             "messaging_signals": recent_signals or [],
             "output_keys": [
                 "profile_update ({style_guide, psych, stressors, trust_style, watchouts, timezone_hint, language, overall_confidence})",

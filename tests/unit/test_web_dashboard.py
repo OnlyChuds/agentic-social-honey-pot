@@ -329,7 +329,7 @@ async def test_fastapi_read_endpoints_and_security(tmp_path: Path) -> None:
         body_chunks = b"".join(
             m.get("body", b"") for m in sent_messages if m["type"] == "http.response.body"
         ).decode()
-        assert 'data: {"type": "update"' in body_chunks
+        assert 'data: {"type": "connected"' in body_chunks
     finally:
         manager.shutdown()
 

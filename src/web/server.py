@@ -53,7 +53,8 @@ def _compute_stream_fingerprint(
 ) -> tuple[Any, ...]:
     files_state: list[tuple[str, int, int]] = []
     if data_dir.exists():
-        for pattern in ("*.db", "*.db-wal", "*.db-shm"):
+        # Watch only .db and .db-wal (never .db-shm, which SQLite touches on reads)
+        for pattern in ("*.db", "*.db-wal"):
             for entry in sorted(data_dir.glob(pattern)):
                 try:
                     st = entry.stat()
@@ -65,6 +66,17 @@ def _compute_stream_fingerprint(
         for r in run_manager.list_runs()
     )
     return (tuple(files_state), runs_state)
+
+
+def _db_fingerprint(db_path: Path, *, is_running: bool) -> tuple[Any, ...]:
+    parts: list[tuple[str, int, int]] = []
+    for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal")):
+        try:
+            st = candidate.stat()
+            parts.append((candidate.name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    return (tuple(parts), is_running)
 
 
 def create_app(
@@ -99,19 +111,37 @@ def create_app(
         allow_headers=["*"],
     )
 
+    targets_cache: dict[str, Any] = {"fp": None, "data": None}
+    detail_cache: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+
     @app.get("/api/targets")
     async def api_list_targets() -> dict[str, Any]:
-        return list_targets(resolved_dir, running_run_ids=manager.running_ids())
+        fp = _compute_stream_fingerprint(resolved_dir, manager)
+        if targets_cache["fp"] == fp and targets_cache["data"] is not None:
+            return dict(targets_cache["data"])
+        data = list_targets(resolved_dir, running_run_ids=manager.running_ids())
+        targets_cache["fp"] = fp
+        targets_cache["data"] = data
+        return data
 
     @app.get("/api/targets/{run_id}")
     async def api_get_target(run_id: str) -> dict[str, Any]:
         db_path = _resolve_db_path(resolved_dir, run_id)
+        is_running = run_id in manager.running_ids()
+        fp = _db_fingerprint(db_path, is_running=is_running)
+        cached = detail_cache.get(run_id)
+        if cached is not None and cached[0] == fp:
+            return cached[1]
         try:
-            return get_target_detail(db_path, is_running=run_id in manager.running_ids())
+            data = get_target_detail(db_path, is_running=is_running)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if len(detail_cache) > 64:
+            detail_cache.clear()
+        detail_cache[run_id] = (fp, data)
+        return data
 
     @app.get("/api/targets/{run_id}/snapshot/{version}")
     async def api_get_snapshot(run_id: str, version: int) -> dict[str, Any]:
@@ -180,20 +210,20 @@ def create_app(
         async def _event_stream() -> AsyncIterator[str]:
             last_fp = _compute_stream_fingerprint(resolved_dir, manager)
             last_ping = time.monotonic()
-            initial_payload = json.dumps({"type": "update", "ts": utc_now_iso()})
+            initial_payload = json.dumps({"type": "connected", "ts": utc_now_iso()})
             yield f"data: {initial_payload}\n\n"
             try:
                 while True:
                     if await request.is_disconnected():
                         break
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                     current_fp = _compute_stream_fingerprint(resolved_dir, manager)
                     if current_fp != last_fp:
                         last_fp = current_fp
                         last_ping = time.monotonic()
                         payload = json.dumps({"type": "update", "ts": utc_now_iso()})
                         yield f"data: {payload}\n\n"
-                    elif time.monotonic() - last_ping >= 15.0:
+                    elif time.monotonic() - last_ping >= 20.0:
                         last_ping = time.monotonic()
                         yield ": ping\n\n"
             except asyncio.CancelledError:
@@ -224,6 +254,11 @@ def main() -> None:
         action="store_true",
         help="Seed the 3 demo practice databases before starting the server",
     )
+    parser.add_argument(
+        "--access-log",
+        action="store_true",
+        help="Enable verbose per-request uvicorn access logging",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -231,7 +266,7 @@ def main() -> None:
         seed_demo_data(data_dir)
 
     app = create_app(data_dir)
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=args.access_log)
 
 
 if __name__ == "__main__":

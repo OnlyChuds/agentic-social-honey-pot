@@ -136,7 +136,7 @@ def check_disclosure_win(
     for cand in disclosure_candidates:
         public_flag = cand.get("public_or_not")
         if isinstance(public_flag, str):
-            is_public = public_flag.strip().lower() in {"public", "true", "yes"}
+            is_public = public_flag.strip().lower() in {"public", "true", "yes", "uncertain"}
         else:
             is_public = bool(public_flag)
         if is_public:
