@@ -694,6 +694,7 @@ class Orchestrator:
             subject=subject,
             idempotency_key=idempotency_key,
             facts_used=facts_used,
+            attachments=attachments,
             cost_touch=True,
         )
         actions.append(

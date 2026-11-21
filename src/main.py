@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import importlib
 import inspect
+import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ from src.models import (
     Hook,
     LandingPageSpec,
     Objective,
+    PortraitAsset,
     Profile,
     Proposal,
     QAVerdict,
@@ -67,9 +70,48 @@ class _StubOsintAgent:
         )
 
 
+def _write_stub_png(path: Path, width: int = 160, height: int = 96) -> Path:
+    """Write a minimal valid RGB PNG for mock/stub dry runs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        return path
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+        return struct.pack("!I", len(data)) + ctype + data + struct.pack("!I", crc)
+
+    rows = bytearray()
+    cx, cy = width // 2, height // 2
+    r_sq = (min(width, height) // 3) ** 2
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r_sq or y < 6:
+                rows.extend((56, 189, 248))
+            else:
+                rows.extend((24, 24, 27))
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
+        + _chunk(b"IEND", b"")
+    )
+    path.write_bytes(raw)
+    return path
+
+
 class _StubIdentityAgent:
+    def __init__(self, *, assets_dir: Path | None = None) -> None:
+        self.assets_dir = assets_dir
+
     async def run(self, snapshot: Snapshot, **kwargs: Any) -> Proposal:
         mode = kwargs.get("mode", "bootstrap")
+        portrait = PortraitAsset()
+        if self.assets_dir is not None:
+            portrait_file = _write_stub_png(self.assets_dir / "lena_hofer_card.png")
+            portrait = PortraitAsset(local=str(portrait_file))
+
         manifest = BrandingManifest(
             concept="event & operations coordinator",
             sender_name="Lena Hofer",
@@ -78,6 +120,7 @@ class _StubIdentityAgent:
             real_org=snapshot.target.org or "TargetOrg",
             domain="eventcrew-svc.example.test",
             email="lena.hofer@eventcrew-svc.example.test",
+            portrait=portrait,
             signature="Lena Hofer\nOperations Coordinator",
         )
         payload: dict[str, Any] = {"manifest": manifest.model_dump(mode="json")}
@@ -226,7 +269,7 @@ class _StubMessagingAgent:
 
         body_parts = [f"Hi {snapshot.target.name or snapshot.target.id}, following up on logistics."]
         page_request: str | None = None
-        attachments: list[dict[str, Any]] = []
+        attachments: list[str | dict[str, Any]] = []
 
         if registered_url:
             body_parts.append(f"Please confirm via {registered_url}")
@@ -234,6 +277,25 @@ class _StubMessagingAgent:
         elif plan is not None and plan.action_artifact is not None:
             attachments.append({"filename": str(plan.action_artifact.get("filename", "doc.pdf"))})
             body_parts.append("Please review the attached document when convenient.")
+
+        portrait_asset_id = (
+            snapshot.identity.portrait.api_asset_id
+            if snapshot.identity is not None and snapshot.identity.portrait.api_asset_id
+            else None
+        )
+        if channel == "email" and portrait_asset_id:
+            attachments.append(portrait_asset_id)
+            body = (
+                '<div style="font-family:Inter,system-ui,sans-serif;color:#18181b;line-height:1.5">'
+                f'<img src="asset://{portrait_asset_id}" alt="EventCrew Badge" '
+                'style="width:160px;height:auto;border-radius:6px;margin-bottom:10px" />'
+                f"<p>{' '.join(body_parts)}</p>"
+                '<p style="color:#52525b;font-size:12px">Lena Hofer · Operations Coordinator · '
+                "EventCrew Services GmbH</p>"
+                "</div>"
+            )
+        else:
+            body = " ".join(body_parts)
 
         return Proposal(
             agent="messaging",
@@ -243,7 +305,7 @@ class _StubMessagingAgent:
                 "mode": "compose",
                 "channel": channel,
                 "subject": "Quick logistics confirmation" if channel == "email" else None,
-                "body": " ".join(body_parts),
+                "body": body,
                 "attachments": attachments,
                 "page_request": page_request,
                 "facts_used": active_facts,
@@ -270,12 +332,13 @@ def build_stub_agents(
     *,
     objective: Objective = "credentials",
     trigger_touch: int = 2,
+    assets_dir: Path | None = None,
 ) -> AgentRegistry:
     """Create deterministic in-memory stub agents for offline mock-API dry runs."""
     return AgentRegistry(
         osint=_StubOsintAgent(),
         profile=_StubProfileAgent(),
-        identity=_StubIdentityAgent(),
+        identity=_StubIdentityAgent(assets_dir=assets_dir),
         strategy=_StubStrategyAgent(objective=objective, trigger_touch=trigger_touch),
         messaging=_StubMessagingAgent(),
         qa=_StubQAAgent(),
@@ -360,7 +423,10 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
         llm: TextLLMClient | None = None
         img: ImageClient | None = None
         if args.dry_run_stub_agents:
-            agents = build_stub_agents(objective=args.stub_objective)
+            agents = build_stub_agents(
+                objective=args.stub_objective,
+                assets_dir=cfg.run.data_dir / "_stub_assets",
+            )
         else:
             llm = TextLLMClient.from_config(cfg.models.text)
             if cfg.models.image.base_url:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+import zlib
 from dataclasses import dataclass, field
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
@@ -7,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from tests.mock_api.personas import PersonaKind, evaluate_persona_reaction
@@ -85,11 +88,33 @@ class MockTargetState:
     sessions: dict[str, MockSession] = field(default_factory=dict)
     conversations: dict[str, MockConversation] = field(default_factory=dict)
     assets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    asset_blobs: dict[str, tuple[bytes, str]] = field(default_factory=dict)
     idempotency_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Fault injection queue: list of HTTP status codes popped on mutating message/session requests
     fault_queue: list[int] = field(default_factory=list)
     # Observability counters for tests
     received_idempotency_keys: list[str] = field(default_factory=list)
+
+    def seed_sample_images(self) -> list[dict[str, Any]]:
+        """Pre-populate sample PNG image assets (avatar + branded badge) in the mock API."""
+        samples = [
+            ("mock_sender_avatar.png", 96, 96, (24, 24, 27), (161, 161, 170)),
+            ("mock_event_banner.png", 240, 80, (17, 24, 39), (56, 189, 248)),
+        ]
+        seeded: list[dict[str, Any]] = []
+        for fname, w, h, bg, accent in samples:
+            raw = _generate_mock_png(w, h, bg, accent)
+            asset_id = f"a_{len(self.assets) + 1}"
+            rec = {
+                "asset_id": asset_id,
+                "filename": fname,
+                "content_type": "image/png",
+                "size": len(raw),
+            }
+            self.assets[asset_id] = rec
+            self.asset_blobs[asset_id] = (raw, "image/png")
+            seeded.append(rec)
+        return seeded
 
     def scenarios(self) -> list[dict[str, Any]]:
         return [
@@ -129,6 +154,36 @@ class MockTargetState:
                 "open": True,
             },
         ]
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack("!I", len(data)) + chunk_type + data + struct.pack("!I", crc)
+
+
+def _generate_mock_png(
+    width: int,
+    height: int,
+    bg_rgb: tuple[int, int, int],
+    accent_rgb: tuple[int, int, int],
+) -> bytes:
+    rows = bytearray()
+    cx, cy = width // 2, height // 2
+    radius_sq = (min(width, height) // 3) ** 2
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= radius_sq or y < max(4, height // 14):
+                rows.extend(accent_rgb)
+            else:
+                rows.extend(bg_rgb)
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, MockTargetState]:
@@ -350,11 +405,34 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             raise HTTPException(status_code=415, detail=f"Unsupported content type: {ctype}")
 
         asset_id = f"a_{len(st.assets) + 1}"
-        rec = {"asset_id": asset_id, "filename": filename, "size": len(raw)}
+        rec = {
+            "asset_id": asset_id,
+            "filename": filename,
+            "content_type": ctype,
+            "size": len(raw),
+        }
         st.assets[asset_id] = rec
+        st.asset_blobs[asset_id] = (raw, ctype)
         if idempotency_key:
             st.idempotency_cache[idempotency_key] = rec
         return rec
+
+    @app.get("/v1/assets")
+    async def list_assets(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+        _check_auth(authorization)
+        return list(st.assets.values())
+
+    @app.get("/v1/assets/{asset_id}")
+    async def get_asset(
+        asset_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        _check_auth(authorization)
+        blob = st.asset_blobs.get(asset_id)
+        if blob is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        raw, ctype = blob
+        return Response(content=raw, media_type=ctype)
 
     @app.post("/v1/sessions/{sid}/conversations")
     async def start_conversation(
