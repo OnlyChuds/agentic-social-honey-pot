@@ -245,9 +245,10 @@ def validate_facts_used(
             continue
         if is_first_contact and fact.provenance == "inferred" and fact.confidence < 0.5:
             warnings.append(
-                f"First-contact message referenced low-confidence inferred fact '{fid}' "
-                f"(confidence={fact.confidence:.2f})."
+                f"Dropped low-confidence inferred fact '{fid}' "
+                f"(confidence={fact.confidence:.2f}) disallowed on first contact."
             )
+            continue
         valid.append(fid)
 
     return valid, warnings
@@ -340,7 +341,7 @@ class MessagingAgent(BaseAgent):
         qa_feedback: QAVerdict | None = None,
         rejection_feedback: str | None = None,
         sent_at: str | None = None,
-        branded_html: bool = False,
+        branded_html: bool | None = None,
         portrait_ref: str | None = None,
         auto_rewrite: bool = True,
     ) -> tuple[MessageDraft, Proposal]:
@@ -398,13 +399,29 @@ class MessagingAgent(BaseAgent):
         )
         draft.facts_used = valid_facts
 
+        if registered_page_url is None and draft.page_request:
+            fact_warnings.append(
+                f"Cleared unregistered page_request '{draft.page_request}' "
+                "(no landing page registered yet)."
+            )
+            draft.page_request = None
+
         if draft.from_sender is None:
             draft.from_sender = resolve_sender_for_channel(snapshot.identity, draft.channel)
         if sent_at is not None:
             draft.sent_at = sent_at
 
-        if (
+        should_wrap_html = (
             branded_html
+            if branded_html is not None
+            else (
+                draft.channel == "email"
+                and snapshot.identity is not None
+                and bool(snapshot.identity.logo_svg or snapshot.identity.palette)
+            )
+        )
+        if (
+            should_wrap_html
             and draft.channel == "email"
             and snapshot.identity is not None
             and "<!doctype html>" not in draft.body.lower()
@@ -590,7 +607,7 @@ class MessagingAgent(BaseAgent):
             qa_feedback=qa_feedback,
             rejection_feedback=kwargs.get("rejection_feedback"),
             sent_at=kwargs.get("sent_at"),
-            branded_html=bool(kwargs.get("branded_html", False)),
+            branded_html=kwargs.get("branded_html"),
             portrait_ref=kwargs.get("portrait_ref"),
             auto_rewrite=bool(kwargs.get("auto_rewrite", True)),
         )

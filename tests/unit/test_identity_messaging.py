@@ -505,8 +505,8 @@ def test_messaging_validators() -> None:
         snap,
         is_first_contact=True,
     )
-    assert valid == ["f_active_1", "f_weak_inf"]
-    assert len(warnings) == 3  # unknown, superseded, and first-contact weak inferred
+    assert valid == ["f_active_1"]
+    assert len(warnings) == 3  # unknown, superseded, and first-contact weak inferred dropped
 
     long_note = MessageDraft(channel="linkedin_connection_request", body="word " * 100)
     trimmed_note, note_warns = enforce_channel_limits(long_note)
@@ -710,6 +710,19 @@ async def test_role1_orchestrator_discovery_and_kwarg_compatibility(tmp_path: Pa
         rejection_feedback="Unknown fact id",
     )
     assert msg_prop.kind == "message"
+    assert "<!doctype html>" in msg_prop.payload["body"].lower()
+
+    # Verify StateManager.validate_message_proposal accepts the composed proposal directly
+    from src.orchestrator.state import StateManager
+    from src.store.db import Store
+
+    store = Store(tmp_path / "compat.db")
+    try:
+        sm = StateManager(store, snapshot=snap.model_copy(deep=True))
+        ok, reason = sm.validate_message_proposal(msg_prop)
+        assert ok is True, reason
+    finally:
+        store.close()
 
     llm.complete = AsyncMock(  # type: ignore[method-assign]
         return_value=TextCompletion(
