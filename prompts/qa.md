@@ -2,7 +2,7 @@
 agent: qa
 trigger: every outbound visual asset (branded email HTML, landing page) before the touch is spent or the page is registered
 temperature: 0.1
-max_tokens: 2048
+max_tokens: 1024
 schema: proposal payload: qa_verdict
 ---
 
@@ -48,6 +48,9 @@ strict, specific, and cheap: concrete fixes, not opinions.
 - `minor` = polish only. Ship with a logged note.
 - Fixes must be concrete and minimal: quote the broken HTML line or name the
   element, and say exactly what changes. No "improve the branding".
+- Never suggest local filesystem paths (e.g. `data/assets/...`) for `<img src>`;
+  any image reference in HTML must use `asset://<api_asset_id>` from the
+  manifest (or omit `<img>` if no `api_asset_id` is available).
 - Score honestly — the runner trusts your numbers for the decision log. A passed
   artifact that judges rate 2/8 costs more than a failed one caught now.
 

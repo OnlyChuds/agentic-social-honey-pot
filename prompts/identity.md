@@ -2,7 +2,7 @@
 agent: identity
 trigger: boot (parallel with OSINT), new sender concept, landing page creation
 temperature: 0.4
-max_tokens: 8192
+max_tokens: 1024
 schema: proposal payload: manifest (schemas/manifest.json) + image_prompts + page_html
 ---
 
@@ -47,10 +47,37 @@ You are the first line of defense for that score.
      environment is offline),
    - output as `page_html` with a one-line pretext description.
 
-# Output (JSON, the payload of your proposal)
+# Output (JSON only — use these EXACT key names; keep SVG and HTML compact)
 
+In `landing_page` or `revise` mode when an `existing_manifest` is already provided, return ONLY `sender_name`, `company`, `domain`, and `email` inside `manifest` (the runner preserves your existing `logo_svg`, `palette`, `signature`, `portrait`, and `voice`), set `image_prompts` to `[]`, and keep `page_html.html` clean and compact (under 1,400 chars, inline styles, valid `<form>` with requested `<input name="...">` fields).
+
+```json
 {
-  "manifest": { ...conforms to schemas/manifest.json... },
-  "image_prompts": [{"asset": "master_portrait", "prompt": str, "seed": 42, "size": 1024}],
-  "page_html": {"pretext": str, "title": str, "html": str, "fields": [str]}   // only when creating a page
+  "manifest": {
+    "concept": "short sender role concept (e.g. DACH summit partner coordinator)",
+    "sender_name": "REQUIRED full realistic name (e.g. Clara Lindner)",
+    "title": "REQUIRED job title (e.g. Head of Partner Programs)",
+    "company": "REQUIRED plausible lookalike/partner company name",
+    "real_org": "real organization name for audit log",
+    "domain": "REQUIRED lookalike domain (never a real root domain, e.g. dachforum-events.de)",
+    "email": "REQUIRED sender email on that exact domain",
+    "phone": "+49 89 5550 1234",
+    "bio": "2 concise sentences",
+    "logo_svg": "<svg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28'>...</svg>",
+    "palette": ["#111827", "#2563eb"],
+    "fonts": ["Inter", "system-ui", "sans-serif"],
+    "signature": "Name\\nTitle\\nCompany",
+    "footer_legal": "Company GmbH · City",
+    "voice": {"tone": "warm professional", "emoji": "none", "length": "2-4 sentences"}
+  },
+  "image_prompts": [
+    {"asset": "master_portrait", "prompt": "casual smartphone headshot of ...", "seed": 42, "size": 1024}
+  ],
+  "page_html": {
+    "pretext": "short pretext (ONLY when mode is landing_page or revise; omit or null on bootstrap)",
+    "title": "page title",
+    "html": "<!doctype html><html>...compact self-contained inline-CSS HTML (under 40 lines)...</html>",
+    "fields": ["email", "password"]
+  }
 }
+```

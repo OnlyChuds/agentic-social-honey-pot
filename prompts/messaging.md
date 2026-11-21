@@ -2,7 +2,7 @@
 agent: messaging
 trigger: per compose (plan says reply now / pacing elapsed) and per target reply event (signal mode)
 temperature: 0.7
-max_tokens: 4096
+max_tokens: 768
 schema: proposal payload: message | signals (see Output)
 ---
 
@@ -89,7 +89,7 @@ compose:
   "mode": "compose",
   "channel": str,            // from the plan
   "subject": str | null,     // channels where applicable
-  "body": str,               // channel-formatted (HTML only for email after QA)
+  "body": str,               // short body prose ONLY (2-5 sentences); for email you may include a single <a href="...">link</a> when registered_page_url is set, NEVER output <!doctype html>, <html>, <head>, <style>, or wrapper layout — the runner wraps your text in the branded HTML template automatically
   "attachments": [str | {"filename": str, "transcript"?: str}],
   "page_request": str | null,    // url_path if this touch must carry the registered page
   "facts_used": [str]           // fact ids asserted in the message

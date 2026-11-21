@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as html_lib
 import re
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -199,6 +200,49 @@ class SignalAssessment(BaseModel):
     reason: str = ""
 
 
+_HTML_STRIP_BLOCKS_RE = re.compile(
+    r"<(head|style|script|svg)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+_HTML_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html_for_context(text: str, *, max_chars: int = 800) -> str:
+    """Convert wrapped HTML email bodies to compact readable text for LLM history context."""
+    if not text or "<" not in text:
+        return text[:max_chars]
+    cleaned = _HTML_STRIP_BLOCKS_RE.sub(" ", text)
+    cleaned = _HTML_ANCHOR_RE.sub(lambda m: f"{m.group(2).strip()} ({m.group(1)})", cleaned)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = html_lib.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_chars]
+
+
+def _compact_conversation_for_llm(snapshot: Snapshot) -> list[dict[str, Any]]:
+    """Return recent conversation turns with HTML wrapper boilerplate stripped."""
+    turns: list[dict[str, Any]] = []
+    for turn in snapshot.conversation.turns[-12:]:
+        item = turn.model_dump(mode="json")
+        if isinstance(item.get("body"), str):
+            item["body"] = _strip_html_for_context(item["body"])
+        turns.append(item)
+    return turns
+
+
+def _compact_manifest_for_llm(manifest: BrandingManifest | None) -> dict[str, Any] | None:
+    """Return persona/voice fields of BrandingManifest without SVG/palette bloat."""
+    if manifest is None:
+        return None
+    data = manifest.model_dump(mode="json")
+    data.pop("logo_svg", None)
+    data.pop("palette", None)
+    data.pop("fonts", None)
+    return data
+
+
 def _trim_at_word_boundary(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -358,16 +402,12 @@ class MessagingAgent(BaseAgent):
         context: dict[str, Any] = {
             "mode": "compose",
             "target": snapshot.target.model_dump(mode="json"),
-            "manifest": (
-                snapshot.identity.model_dump(mode="json")
-                if snapshot.identity is not None
-                else None
-            ),
+            "manifest": _compact_manifest_for_llm(snapshot.identity),
             "profile": snapshot.profile.model_dump(mode="json"),
             "hooks": [h.model_dump(mode="json") for h in ranked_hooks],
             "facts": [f.model_dump(mode="json") for f in snapshot.facts if f.status == "active"],
             "touch": active_touch.model_dump(mode="json") if active_touch is not None else None,
-            "conversation": [t.model_dump(mode="json") for t in snapshot.conversation.turns],
+            "conversation": _compact_conversation_for_llm(snapshot),
             "registered_page_url": registered_page_url,
             "is_first_contact": is_first_contact,
         }
@@ -539,7 +579,7 @@ class MessagingAgent(BaseAgent):
             "target": snapshot.target.model_dump(mode="json"),
             "profile": snapshot.profile.model_dump(mode="json"),
             "hooks": [h.model_dump(mode="json") for h in snapshot.hooks],
-            "conversation": [t.model_dump(mode="json") for t in snapshot.conversation.turns],
+            "conversation": _compact_conversation_for_llm(snapshot),
             "target_event": target_event,
         }
         signal = await self.run_json(context, SignalAssessment, temperature=0.2)
