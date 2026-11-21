@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -479,4 +480,77 @@ async def test_strategy_short_circuits_when_budget_exhausted() -> None:
     assert prop.payload["touches"] == []
     assert prop.payload["session_restart"]["recommended"] is True
     assert llm.complete_json.call_count == 0
+    await llm.aclose()
+
+
+def test_placeholder_your_name_caught_and_osint_refresh_suppressed() -> None:
+    from src.agents.messaging import MessageDraft, lint_message_style
+    from src.orchestrator.policy import TriggerPolicy
+
+    draft = MessageDraft(
+        channel="email",
+        subject="Quick note",
+        body="Hi Robert,\n\nQuick note.\n\nBest,\n[Your Name]",
+    )
+    errs = lint_message_style(draft)
+    assert any("placeholder" in e.lower() or "your name" in e.lower() for e in errs)
+
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=1)
+    snap.profile.overall_confidence = 0.4
+    snap.facts = [
+        Fact(fact_id=f"f_{i}", claim=f"fact {i}", provenance="osint", confidence=0.9)
+        for i in range(5)
+    ]
+    policy = TriggerPolicy(min_gap_s=0.0)
+    assert policy.should_trigger_osint_refresh(snap) is False
+    assert policy.should_trigger_osint_refresh(snap, explicit_request=True) is True
+
+
+@pytest.mark.asyncio
+async def test_identity_bootstrap_fallback_and_logo_image_generation(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from src.agents.identity import IdentityAgent, wrap_branded_email_html
+    from src.llm.image import GeneratedImage, ImageClient
+
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=0)
+    llm = TextLLMClient(base_url="https://llm.test/v1", api_key="k")
+    llm.complete_json = AsyncMock(side_effect=ValueError("broken json"))  # type: ignore[method-assign]
+
+    img_client = MagicMock(spec=ImageClient)
+    portrait_path = tmp_path / "portrait.png"
+    logo_path = tmp_path / "logo.png"
+    portrait_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    logo_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    img_client.generate_portrait = AsyncMock(
+        return_value=GeneratedImage(
+            png_bytes=b"\x89PNG\r\n\x1a\n",
+            filename="portrait.png",
+            prompt_id="p1",
+            seed=42,
+            local_path=portrait_path,
+        )
+    )
+    img_client.generate_fast = AsyncMock(
+        return_value=GeneratedImage(
+            png_bytes=b"\x89PNG\r\n\x1a\n",
+            filename="logo.png",
+            prompt_id="p2",
+            seed=42,
+            local_path=logo_path,
+        )
+    )
+
+    agent = IdentityAgent(llm, image_client=img_client, assets_dir=tmp_path)
+    output, prop = await agent.build(snap, mode="bootstrap")
+    assert output.manifest.sender_name
+    assert output.manifest.domain
+    assert output.manifest.email
+    assert img_client.generate_portrait.call_count == 1
+    assert img_client.generate_fast.call_count == 1
+    assert "logo" in prop.payload.get("generated_assets", {})
+
+    output.manifest.logo_svg = '<img src="asset://a_logo" alt="Logo" style="width:28px;height:28px;">'
+    html = wrap_branded_email_html(output.manifest, subject="Test", body_html="Hello")
+    assert 'src="asset://a_logo"' in html
     await llm.aclose()

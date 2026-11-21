@@ -195,6 +195,20 @@ class Orchestrator:
                         ):
                             ident.portrait.api_asset_id = record.asset_id
                             self.state.store.save_snapshot(self.snapshot)
+                        elif (
+                            ident is not None
+                            and any(
+                                tok in asset_name.lower()
+                                for tok in ("logo", "badge", "icon", "emblem")
+                            )
+                        ):
+                            alt = (ident.company or ident.sender_name or "Logo").replace('"', "'")
+                            ident.logo_svg = (
+                                f'<img src="asset://{record.asset_id}" alt="{alt}" '
+                                'style="width:28px;height:28px;border-radius:4px;'
+                                'object-fit:contain;display:block;">'
+                            )
+                            self.state.store.save_snapshot(self.snapshot)
                     except (AssetLimitError, TargetAPIError) as exc:
                         self.state.record_system_error(
                             "identity",

@@ -143,6 +143,11 @@ class TriggerPolicy:
             return False
         if explicit_request:
             return True
+        active_osint_facts = [
+            f for f in snapshot.facts if f.status == "active" and f.provenance == "osint"
+        ]
+        if len(active_osint_facts) >= 4:
+            return False
         return snapshot.profile.overall_confidence < 0.5
 
     def _engagement_is_declining(self) -> bool:

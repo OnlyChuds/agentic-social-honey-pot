@@ -66,7 +66,8 @@ _PLACEHOLDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "Bracketed placeholder",
         re.compile(
-            r"\[(?:name|first[\s_-]?name|last[\s_-]?name|company|org|link|url|date|title|sender|insert[^\]]*)\]",
+            r"\[(?:(?:your|my|sender|target|customer|client)[\s_-]?)?"
+            r"(?:name|first[\s_-]?name|last[\s_-]?name|company|org|link|url|date|title|sender|email|phone|role|insert[^\]]*)\]",
             re.IGNORECASE,
         ),
     ),

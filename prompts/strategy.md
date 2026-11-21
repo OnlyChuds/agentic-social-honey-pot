@@ -3,7 +3,7 @@ agent: strategy
 trigger: plan (after profile commit), pivot triggers (2 no-reply touches, suspicion >= 0.6,
          3 same-channel touches with declining engagement, page trigger reached)
 temperature: 0.3
-max_tokens: 1200
+max_tokens: 2048
 schema: proposal payload: plan (schemas/plan.json)
 ---
 

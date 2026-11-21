@@ -280,8 +280,21 @@ class StrategyAgent(BaseAgent):
             violations = validate_campaign_plan(
                 plan, snapshot, max_touches=max_touches, pivot_reason=pivot_reason
             )
+            semantic_violations = [
+                v
+                for v in violations
+                if any(
+                    kw in v.lower()
+                    for kw in (
+                        "exhausted",
+                        "landing_page",
+                        "drops below",
+                        "must contain at least 1",
+                    )
+                )
+            ]
             for _ in range(max_repairs):
-                if not violations:
+                if not semantic_violations:
                     break
                 repair_messages = [
                     *messages,
@@ -290,7 +303,7 @@ class StrategyAgent(BaseAgent):
                         "role": "user",
                         "content": (
                             "Your plan violated hard campaign constraints:\n"
-                            + "\n".join(f"- {v}" for v in violations)
+                            + "\n".join(f"- {v}" for v in semantic_violations)
                             + "\nReturn a corrected compact JSON CampaignPlan fixing every violation."
                         ),
                     },
@@ -308,6 +321,19 @@ class StrategyAgent(BaseAgent):
                 violations = validate_campaign_plan(
                     plan, snapshot, max_touches=max_touches, pivot_reason=pivot_reason
                 )
+                semantic_violations = [
+                    v
+                    for v in violations
+                    if any(
+                        kw in v.lower()
+                        for kw in (
+                            "exhausted",
+                            "landing_page",
+                            "drops below",
+                            "must contain at least 1",
+                        )
+                    )
+                ]
 
             if violations:
                 plan = _clamp_plan_to_budget(plan, snapshot, max_touches)

@@ -295,7 +295,11 @@ def render_landing_page(spec: LandingPageSpec, manifest: BrandingManifest) -> Pa
         )
     form_inputs = "".join(inputs)
 
-    logo_block = manifest.logo_svg.strip() if manifest.logo_svg.strip().startswith("<svg") else ""
+    logo_block = (
+        manifest.logo_svg.strip()
+        if manifest.logo_svg.strip().startswith(("<svg", "<img"))
+        else ""
+    )
     logo_span = f"<span>{logo_block}</span>" if logo_block else ""
     safe_email = manifest.email.strip()
     mailto_line = ""
