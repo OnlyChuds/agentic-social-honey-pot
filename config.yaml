@@ -1,0 +1,52 @@
+# Runtime config. ${ENV} references are resolved from the environment at load
+# time (src/config.py). Per-run overrides via CLI flags.
+
+run:
+  scenario: practice            # practice | eval
+  target_id: julius             # practice persona id; set at runtime for eval
+  run_no: 1
+  data_dir: data                # sqlite db, renders, asset cache
+
+pacing:
+  min_gap_s: 600                # min seconds between touches (eval default 15 min)
+  silence_check_s: 120
+
+budgets:
+  osint_max_usd_eval: 0.75
+  osint_max_usd_practice: 2.0
+  osint_escalation: auto        # auto | capped_l2 | max
+  max_revisions: 2              # QA revision cycles before shipping with warning
+
+models:
+  text:
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    model: ${LLM_MODEL}
+  image:
+    base_url: ${IMAGE_BASE_URL}
+    api_key: ${IMAGE_API_KEY}
+    model: ${IMAGE_MODEL}
+
+target_api:
+  base_url: ${TARGET_API_URL}
+  team_key: ${TEAM_API_KEY}
+  rate:
+    req_per_min: 50             # API allows 60
+    max_parallel: 5             # API allows 6
+  retry:
+    backoff_s: [30, 60, 90]     # 429/503, always same Idempotency-Key
+
+apify:
+  # Actor IDs rotate in beta; re-pin after each `diagnose.sh` run.
+  # Fallback: apify.sh store-search "<keyword>"
+  actors:
+    linkedin_profile: ""
+    x_profile: ""
+    instagram_profile: ""
+    youtube_channel: ""
+
+aggressive:                     # pre-baked for short eval windows (<90 min)
+  pacing:
+    min_gap_s: 300
+  budget:
+    compressed_plan_touches: 8
