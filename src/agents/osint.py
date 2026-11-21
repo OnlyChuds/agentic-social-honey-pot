@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.agents.base import BaseAgent
 from src.config import AppConfig
@@ -105,6 +107,44 @@ def _fallback_dossier(result: OsintResult, name: str, org: str) -> DossierPayloa
     )
 
 
+_CACHE_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _osint_cache_enabled(explicit: bool | None, *, injected_engine: bool, explicit_dir: bool) -> bool:
+    if explicit is not None:
+        return explicit
+    if injected_engine and not explicit_dir:
+        return False
+    env_flag = os.environ.get("OSINT_CACHE", "1").strip().lower()
+    return env_flag not in {"0", "false", "no", "off"}
+
+
+def _slugify_key_part(value: str) -> str:
+    return _CACHE_SLUG_RE.sub("_", value.strip().lower()).strip("_")
+
+
+def osint_cache_path(
+    cache_dir: Path,
+    *,
+    scenario: str,
+    target_id: str,
+    name: str,
+    org: str,
+) -> Path:
+    """Deterministic per-person OSINT cache JSON path."""
+    parts = [
+        _slugify_key_part(scenario) or "run",
+        _slugify_key_part(target_id or name) or "target",
+        _slugify_key_part(name),
+        _slugify_key_part(org),
+    ]
+    deduped: list[str] = []
+    for part in parts:
+        if part and part not in deduped:
+            deduped.append(part)
+    return cache_dir / f"{'__'.join(deduped)}.json"
+
+
 class OSINTAgent(BaseAgent):
     """Research agent: parallel burst OSINT (src/osint) + one LLM call to synthesize a dossier Proposal."""
 
@@ -118,11 +158,69 @@ class OSINTAgent(BaseAgent):
         config: AppConfig | None = None,
         engine: OsintEngine | None = None,
         prompts_dir: Path = Path("prompts"),
+        cache_dir: Path | None = None,
+        use_cache: bool | None = None,
     ) -> None:
         super().__init__(llm, prompts_dir=prompts_dir)
         self.config = config
         self._injected_engine = engine
         self.last_result: OsintResult | None = None
+        if cache_dir is not None:
+            self.cache_dir = Path(cache_dir)
+        elif config is not None:
+            self.cache_dir = Path(config.run.data_dir) / "osint_cache"
+        else:
+            self.cache_dir = Path("data/osint_cache")
+        self._explicit_cache_dir = cache_dir is not None
+        self._use_cache_override = use_cache
+
+    def _cache_file_for(self, snapshot: Snapshot) -> Path:
+        target = snapshot.target
+        return osint_cache_path(
+            self.cache_dir,
+            scenario=snapshot.run.scenario,
+            target_id=target.id or snapshot.run.target_id,
+            name=target.name,
+            org=target.org,
+        )
+
+    def _load_cached_dossier(self, cache_file: Path) -> DossierPayload | None:
+        if not cache_file.is_file():
+            return None
+        try:
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+            payload = raw.get("dossier", raw) if isinstance(raw, dict) else raw
+            dossier = DossierPayload.model_validate(payload)
+        except (OSError, json.JSONDecodeError, ValidationError):
+            return None
+        if len(dossier.facts) < 3 or dossier.completeness == "thin":
+            return None
+        return dossier
+
+    def _save_cached_dossier(
+        self,
+        cache_file: Path,
+        dossier: DossierPayload,
+        snapshot: Snapshot,
+    ) -> None:
+        if len(dossier.facts) < 3 or dossier.completeness not in {"full", "partial"}:
+            return
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            envelope = {
+                "scenario": snapshot.run.scenario,
+                "target": snapshot.target.model_dump(mode="json"),
+                "saved_at_unix": round(time.time(), 3),
+                "dossier": dossier.model_dump(mode="json"),
+            }
+            tmp_file = cache_file.with_suffix(".json.tmp")
+            tmp_file.write_text(
+                json.dumps(envelope, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_file.replace(cache_file)
+        except OSError:
+            return
 
     def _make_engine(self, scenario: str, max_budget_usd: float | None) -> OsintEngine:
         if self._injected_engine is not None:
@@ -147,11 +245,40 @@ class OSINTAgent(BaseAgent):
         focus_question: str | None = None,
         max_rounds: int = 8,
         max_budget_usd: float | None = None,
+        use_cache: bool | None = None,
         **_extra: Any,
     ) -> Proposal:
         del max_rounds
         t_start = time.monotonic()
         target = snapshot.target
+        cache_allowed = (
+            _osint_cache_enabled(
+                use_cache if use_cache is not None else self._use_cache_override,
+                injected_engine=self._injected_engine is not None,
+                explicit_dir=self._explicit_cache_dir,
+            )
+            and (mode in {None, "bootstrap"})
+            and not (focus_question and focus_question.strip())
+        )
+        cache_file = self._cache_file_for(snapshot)
+        if cache_allowed:
+            cached = self._load_cached_dossier(cache_file)
+            if cached is not None:
+                cached_copy = cached.model_copy(deep=True)
+                cached_copy.budget_spent_usd = 0.0
+                self.last_result = OsintResult(
+                    org_domain=cached_copy.org_branding.real_domain,
+                    budget_usd=0.0,
+                    total_s=time.monotonic() - t_start,
+                    timings={"bursts_s": 0.0, "cache_hit": 1.0},
+                )
+                rationale = (
+                    f"OSINT (cached {cached_copy.completeness}): {len(cached_copy.facts)} facts, "
+                    f"{len(cached_copy.hook_seeds)} hook seeds, $0.000 spent "
+                    f"(cache hit: {cache_file.name})."
+                )
+                return self.make_proposal(snapshot, cached_copy, rationale=rationale)
+
         engine = self._make_engine(snapshot.run.scenario, max_budget_usd)
         result = await engine.run(
             target.name,
@@ -261,6 +388,8 @@ class OSINTAgent(BaseAgent):
                 dossier = _fallback_dossier(result, target.name, target.org)
         dossier = _normalize_dossier(dossier, result)
         result.total_s = time.monotonic() - t_start
+        if cache_allowed:
+            self._save_cached_dossier(cache_file, dossier, snapshot)
 
         ok_sources = sum(1 for s in result.sources if s.ok and s.text)
         rationale = (
