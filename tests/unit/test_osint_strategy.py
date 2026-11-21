@@ -554,3 +554,67 @@ async def test_identity_bootstrap_fallback_and_logo_image_generation(tmp_path: P
     html = wrap_branded_email_html(output.manifest, subject="Test", body_html="Hello")
     assert 'src="asset://a_logo"' in html
     await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_osint_agent_caches_dossier_per_person_and_bypasses_on_refresh(tmp_path: Path) -> None:
+    eng = OsintEngine(tavily_key="k", max_budget_usd=1.0)
+    mock_result = OsintResult(
+        sources=[
+            Source(
+                provider="tavily",
+                kind="search",
+                label="person",
+                url="https://www.revel8.ai/author-julius",
+                title="Julius Muth",
+                text="Co-Founder & Co-CEO of revel8",
+                ok=True,
+            )
+        ],
+        timings={"bursts_s": 1.5},
+        budget_usd=0.03,
+        org_domain="revel8.ai",
+        total_s=1.5,
+    )
+    eng.run = AsyncMock(return_value=mock_result)  # type: ignore[method-assign]
+
+    dossier_obj = DossierPayload(
+        facts=[
+            Fact(fact_id=f"f_0{i}", claim=f"Fact {i}", source="https://revel8.ai", confidence=0.9, osint_grade="A")
+            for i in range(1, 5)
+        ],
+        hook_seeds=[Hook(hook_id="h_01", topic="Celonis alumni", evidence=["f_01"], confidence=0.8)],
+        psychoprofile=[PsychTrait(trait="Direct", confidence=0.6, evidence=["f_01"])],
+        org_branding=OrgBranding(real_domain="revel8.ai", brand_keywords=["AI-native"]),
+        budget_spent_usd=0.03,
+        escalation_level=2,
+        completeness="full",
+    )
+
+    llm = TextLLMClient(base_url="https://llm.test/v1", api_key="k")
+    llm.complete_json = AsyncMock(return_value=dossier_obj)  # type: ignore[method-assign]
+    agent = OSINTAgent(llm, engine=eng, cache_dir=tmp_path)
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=0)
+
+    # First run: cache miss -> calls engine + LLM and writes cache file
+    p1 = await agent.run(snap, mode="bootstrap")
+    assert eng.run.call_count == 1
+    assert llm.complete_json.call_count == 1
+    assert "cached" not in p1.rationale.lower()
+    cached_files = list(tmp_path.glob("*.json"))
+    assert len(cached_files) == 1
+
+    # Second run for same person: instant cache hit -> 0 engine/LLM calls
+    p2 = await agent.run(snap, mode="bootstrap")
+    assert eng.run.call_count == 1
+    assert llm.complete_json.call_count == 1
+    assert "cached" in p2.rationale.lower()
+    assert p2.payload["budget_spent_usd"] == 0.0
+    assert len(p2.payload["facts"]) == 4
+
+    # Refresh mode bypasses cache
+    p3 = await agent.run(snap, mode="refresh")
+    assert eng.run.call_count == 2
+    assert llm.complete_json.call_count == 2
+    assert "cached" not in p3.rationale.lower()
+    await llm.aclose()
