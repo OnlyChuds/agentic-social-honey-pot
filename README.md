@@ -26,6 +26,7 @@
 - [Craft Score & Layout Evaluation](#craft-score--layout-evaluation)
 - [Limits & Error Codes](#limits--error-codes)
 - [Rules & Guidelines](#rules--guidelines)
+- [Self-Hosted Model Endpoints (AMD Radeon Cloud)](#self-hosted-model-endpoints-amd-radeon-cloud)
 
 ---
 
@@ -395,3 +396,104 @@ In **Eval** mode, emails and landing pages are visually rendered post-run in hea
 2. **Strict Simulation Boundary:** No communications may leave the target API environment. Out-of-bounds contact with real individuals or services will result in immediate disqualification.
 3. **Target Personas Only:** Prompt injection attacks targeting the underlying system simulator (e.g., `"ignore previous instructions"`) are detected, logged, and void the session.
 4. **No Malware:** Do not upload or transmit executable binaries, exploits, or malicious code.
+
+---
+
+## 🤖 Self-Hosted Model Endpoints (AMD Radeon Cloud)
+
+We host both our text LLM and image generation model on dedicated 2× 48 GB AMD Radeon Pro W7900D instances. Copy `.env.example` to `.env` and ask a teammate for `LLM_API_KEY` (never commit `.env` or real keys).
+
+### 1. Text LLM — `Qwen3.8-27B-abliterated` (vLLM · OpenAI-Compatible)
+
+| Setting | Value |
+|---|---|
+| **Base URL (`LLM_BASE_URL`)** | `https://rc-a38ff61e5d582336.radeon.firstdg.ai/v1` |
+| **Model ID (`LLM_MODEL`)** | `Qwen3.8-27B-abliterated` |
+| **Auth (`LLM_API_KEY`)** | Bearer token (ask team chat; unauthenticated `/v1/*` returns `401`) |
+| **Context Window** | `65,536` tokens |
+| **Features** | Streaming, reasoning (`--reasoning-parser qwen3`), tool calling (`--tool-call-parser qwen3_coder`) |
+| **Browser Chat UI** | `https://rc-a38ff61e5d582336.radeon.firstdg.ai/` |
+| **OpenCode Setup** | See [opencode-setup.md](./opencode-setup.md) |
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["LLM_BASE_URL"],
+    api_key=os.environ["LLM_API_KEY"],
+)
+
+resp = client.chat.completions.create(
+    model=os.getenv("LLM_MODEL", "Qwen3.8-27B-abliterated"),
+    messages=[{"role": "user", "content": "Hello!"}],
+    temperature=0.7,
+    # Set enable_thinking=False for fast direct responses; omit/True for reasoning
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(resp.choices[0].message.content)
+```
+
+---
+
+### 2. Image Generation & Editing — `Qwen-Image-2.1` (ComfyUI REST API)
+
+| Setting | Value |
+|---|---|
+| **Base URL (`IMAGE_BASE_URL`)** | `https://YOUR_COMFYUI_URL` *(ask team chat — no built-in auth, do not commit)* |
+| **Diffusion Models** | `qwen_image_2.1_bf16.safetensors` (25-step HQ), `qwen_image_2.1_turbo_bf16.safetensors` (8-step fast) |
+| **Text Encoder** | `qwen3vl_8b_bf16.safetensors` (`type: "qwen_image"`) |
+| **VAE** | `qwen_image_2.1_vae_bf16.safetensors` (native 4-channel transparent RGBA support) |
+| **LoRAs** | `casual_phone_photo_lbxstyle.safetensors` (trigger: `lbxstyle`, strength `0.65–0.85`), `natural_exposure_qwen21.safetensors` |
+
+**Pre-loaded Workflows in ComfyUI UI (Workflows sidebar):**
+- `01_Simple_Fast_Turbo_8steps.json` — fast 8-step T2I (~6–10s warm; logos, text, general images)
+- `02_Simple_HighQuality_25steps.json` — 25-step full BF16 T2I (`KSampler`, `cfg=1.0`, `euler`, `simple`)
+- `03_Simple_Image_Edit_Turbo.json` — 8-step reference-guided image editing / avatar restyling (prevents face drift)
+- `04_Simple_Real_People_Portrait_LoRA.json` — realistic candid photos of real people using `casual_phone_photo_lbxstyle.safetensors`
+
+**REST API Endpoints (for `src/llm/image.py` tool calls):**
+- `POST /upload/image` — upload a reference portrait/logo (`multipart/form-data`, field `image`) for editing workflows
+- `POST /prompt` — queue a workflow prompt graph (`{"prompt": {...}}`), returns `{"prompt_id": "..."}`
+- `GET /history/{prompt_id}` — poll until `prompt_id` appears with `outputs`
+- `GET /view?filename=<name>&type=output` — download generated PNG bytes
+
+**Minimal Python Example (Realistic Persona Portrait with LoRA):**
+```python
+import os, time, requests
+
+COMFY = os.environ["IMAGE_BASE_URL"]
+
+graph = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_bf16.safetensors", "weight_dtype": "default"}},
+    "9": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "casual_phone_photo_lbxstyle.safetensors", "strength_model": 0.75}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_bf16.safetensors", "type": "qwen_image", "device": "default"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
+    "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+    "5": {"class_type": "TextEncodeQwenImage21", "inputs": {
+        "clip": ["2", 0],
+        "prompt": "lbxstyle, casual smartphone photo of a 36-year-old European operations manager at an office desk near a window, wearing a navy sweater, natural unretouched skin, uneven indoor lighting, unedited real snapshot",
+        "negative_prompt": "",
+        "resolution": 1024,
+    }},
+    "6": {"class_type": "KSampler", "inputs": {
+        "model": ["9", 0], "positive": ["5", 0], "negative": ["5", 1], "latent_image": ["4", 0],
+        "seed": 107, "steps": 25, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
+    }},
+    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+    "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "persona_avatar"}},
+}
+
+pid = requests.post(f"{COMFY}/prompt", json={"prompt": graph}, timeout=30).json()["prompt_id"]
+while True:
+    hist = requests.get(f"{COMFY}/history/{pid}", timeout=15).json()
+    if pid in hist:
+        fname = hist[pid]["outputs"]["8"]["images"][0]["filename"]
+        png_bytes = requests.get(f"{COMFY}/view", params={"filename": fname, "type": "output"}, timeout=30).content
+        with open("avatar.png", "wb") as f:
+            f.write(png_bytes)
+        break
+    time.sleep(1.5)
+```
+
+> **Prompting tip for realistic people:** Always include `lbxstyle` with `casual_phone_photo_lbxstyle.safetensors` (`0.65–0.85`) and concrete real-world camera cues (`smartphone photo`, `overcast daylight`, `unretouched skin`). Avoid glossy buzzwords like `editorial`, `studio lighting`, `85mm f/1.8`, `cinematic`, or `8k`.
