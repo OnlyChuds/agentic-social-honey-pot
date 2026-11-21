@@ -618,3 +618,42 @@ async def test_osint_agent_caches_dossier_per_person_and_bypasses_on_refresh(tmp
     assert llm.complete_json.call_count == 2
     assert "cached" not in p3.rationale.lower()
     await llm.aclose()
+
+
+def test_email_auto_linkify_first_name_signoff_and_attachment_guards() -> None:
+    from src.agents.identity import wrap_branded_email_html
+    from src.agents.messaging import MessageDraft, enforce_channel_limits, lint_message_style
+    from src.models import BrandingManifest
+
+    manifest = BrandingManifest(
+        sender_name="Clara Lindner",
+        title="Head of Partner Programs",
+        company="NordicGrid Ventures",
+        domain="nordicgrid-events.de",
+        email="clara@nordicgrid-events.de",
+        palette=["#111827", "#2563eb"],
+        signature="Clara Lindner\nHead of Partner Programs\nNordicGrid Ventures",
+    )
+    html = wrap_branded_email_html(
+        manifest,
+        subject="DACH Summit",
+        body_html=(
+            "Hi Tom,\n\nHere is the page: https://nordicgrid-events.de/summit/register.\n\n"
+            "Best, Clara"
+        ),
+    )
+    assert '<a href="https://nordicgrid-events.de/summit/register"' in html
+    assert "Best, Clara" not in html
+
+    draft = MessageDraft(
+        channel="email",
+        subject="Re: Re: Re: DACH Summit",
+        body="Attached is the agenda.",
+        attachments=["agenda_march_2027.pdf"],
+    )
+    errs = lint_message_style(draft)
+    assert any("bare filename string" in e.lower() for e in errs)
+
+    cleaned, _warns = enforce_channel_limits(draft)
+    assert cleaned.subject == "Re: DACH Summit"
+    assert cleaned.attachments == [{"filename": "agenda_march_2027.pdf"}]

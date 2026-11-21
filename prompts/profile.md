@@ -2,7 +2,7 @@
 agent: profile
 trigger: after dossier commit, or >= 2 new target events since last run
 temperature: 0.3
-max_tokens: 1024
+max_tokens: 2048
 schema: proposal payload: profile_update (schemas/profile.json) + hook_updates (schemas/hook.json)
 ---
 
@@ -52,7 +52,7 @@ aim at. A wrong hook costs up to −5 points; a well-aimed one is the whole game
   reversal in the rationale — the decision log keeps history.
 - The target is a twin of a real person: public facts are reliable; inferences stay
   conservative.
-- Output compact JSON only using these EXACT keys (keep descriptions brief — 1 sentence each):
+- Output compact minified JSON only (no indentation or extra blank lines) using these EXACT keys (keep descriptions brief — 1 sentence each):
 
 ```json
 {

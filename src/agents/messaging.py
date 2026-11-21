@@ -75,6 +75,8 @@ _PHANTOM_ATTACHMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _SUBJECT_BODY_LEAK_RE = re.compile(r"\b(?:hi|hello|hey)\s+[A-Z][a-z]+,", re.IGNORECASE)
+_STACKED_RE_PREFIX_RE = re.compile(r"^(?:re:\s*){2,}", re.IGNORECASE)
+_ASSET_ID_STR_RE = re.compile(r"^(?:asset://)?a_[A-Za-z0-9_-]+$")
 SUBJECT_MAX_CHARS = 90
 
 
@@ -324,6 +326,7 @@ def enforce_channel_limits(draft: MessageDraft) -> tuple[MessageDraft, list[str]
 
     if updated.subject is not None:
         cleaned_subj = re.sub(r"\s+", " ", updated.subject).strip()
+        cleaned_subj = _STACKED_RE_PREFIX_RE.sub("Re: ", cleaned_subj)
         leak_match = _SUBJECT_BODY_LEAK_RE.search(cleaned_subj)
         if leak_match and leak_match.start() > 0:
             cleaned_subj = cleaned_subj[: leak_match.start()].strip(" -:;,")
@@ -338,6 +341,23 @@ def enforce_channel_limits(draft: MessageDraft) -> tuple[MessageDraft, list[str]
     ):
         updated.subject = "Quick follow-up"
         warnings.append(f"Added fallback subject for channel '{updated.channel}'.")
+
+    # Convert any stray bare non-asset filename strings into valid virtual attachment dicts
+    if updated.attachments:
+        normalized_atts: list[str | dict[str, Any]] = []
+        for item in updated.attachments:
+            if isinstance(item, str):
+                raw = item.strip()
+                if _ASSET_ID_STR_RE.match(raw):
+                    normalized_atts.append(raw.removeprefix("asset://"))
+                elif raw:
+                    normalized_atts.append({"filename": Path(raw).name})
+                    warnings.append(
+                        f"Converted bare attachment filename '{raw}' to virtual attachment object."
+                    )
+            else:
+                normalized_atts.append(item)
+        updated.attachments = normalized_atts
 
     att_limit = MAX_TURN_ATTACHMENTS if updated.channel in LIVE_CHANNELS else MAX_MESSAGE_ATTACHMENTS
     if len(updated.attachments) > att_limit:
@@ -375,6 +395,14 @@ def lint_message_style(draft: MessageDraft) -> list[str]:
             "Body claims an attachment is included, but `attachments` is empty — "
             "either include a concrete attachment or remove the 'attached' wording."
         )
+
+    for att in draft.attachments:
+        if isinstance(att, str) and not _ASSET_ID_STR_RE.match(att.strip()):
+            issues.append(
+                f"Bare filename string '{att}' in `attachments` is not a valid uploaded asset ID — "
+                "use a virtual object `{\"filename\": ..., \"transcript\": \"...detailed contents...\"}` "
+                "or omit the attachment."
+            )
 
     for placeholder_issue in check_placeholders(combined):
         issues.append(placeholder_issue.fix)

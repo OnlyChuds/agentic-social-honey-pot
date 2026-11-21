@@ -79,19 +79,72 @@ def _safe_hex_color(value: str, fallback: str) -> str:
 
 _TRAILING_HTML_P_RE = re.compile(r"<p\b[^>]*>((?:(?!</p>)[\s\S])*)</p>\s*$", re.IGNORECASE)
 _INLINE_TAG_RE = re.compile(r"<[^>]+>")
+_SIGNOFF_PREFIX_RE = re.compile(
+    r"^(?:best|regards|best regards|warm regards|kind regards|thanks|cheers|sincerely)[,!.\s]+",
+    re.IGNORECASE,
+)
+_BARE_URL_RE = re.compile(r"(?<!href=[\"'])(?<!src=[\"'])(https?://[^\s<>\"')]+)", re.IGNORECASE)
+
+
+def _linkify_plain_text_escaped(escaped: str, accent: str) -> str:
+    """Turn bare https:// URLs in HTML-escaped text into clean clickable anchor tags."""
+    def _repl(match: re.Match[str]) -> str:
+        raw_url = match.group(1)
+        trailing = ""
+        while raw_url and raw_url[-1] in ".,;:!?":
+            trailing = raw_url[-1] + trailing
+            raw_url = raw_url[:-1]
+        return (
+            f'<a href="{raw_url}" style="color:{accent};text-decoration:underline;">'
+            f"{raw_url}</a>{trailing}"
+        )
+
+    return _BARE_URL_RE.sub(_repl, escaped)
+
+
+def _linkify_html_fragment(fragment: str, accent: str) -> str:
+    """Linkify bare https:// URLs inside HTML text nodes without touching existing <a> tags."""
+    parts = re.split(r"(<a\b[\s\S]*?</a>|<[^>]+>)", fragment, flags=re.IGNORECASE)
+    for idx in range(0, len(parts), 2):
+        if "http://" in parts[idx] or "https://" in parts[idx]:
+            parts[idx] = _linkify_plain_text_escaped(parts[idx], accent)
+    return "".join(parts)
 
 
 def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -> str:
     """Remove trailing duplicate signature/name/footer lines (plain text or trailing HTML <p>)."""
     sig_lines = [line.strip() for line in manifest.signature.splitlines() if line.strip()]
     known_tail_lines = {line.lower() for line in sig_lines}
+    first_name = manifest.sender_name.strip().split()[0].lower() if manifest.sender_name.strip() else ""
     for extra in (manifest.sender_name, manifest.title, manifest.company, manifest.footer_legal):
         if extra and extra.strip():
             known_tail_lines.add(extra.strip().lower())
+    if first_name:
+        known_tail_lines.add(first_name)
     if not known_tail_lines:
         return body
 
-    signoffs = {"best", "regards", "best regards", "warm regards", "thanks", "cheers"}
+    signoffs = {
+        "best",
+        "regards",
+        "best regards",
+        "warm regards",
+        "kind regards",
+        "thanks",
+        "cheers",
+        "sincerely",
+    }
+
+    def _is_tail_line(line: str) -> tuple[bool, bool]:
+        norm = line.lower().strip().rstrip(",.!")
+        if norm in known_tail_lines:
+            return True, True
+        if norm in signoffs:
+            return True, False
+        stripped = _SIGNOFF_PREFIX_RE.sub("", norm).strip().rstrip(",.!")
+        if stripped and stripped != norm and stripped in known_tail_lines:
+            return True, True
+        return False, False
 
     # Handle HTML paragraph bodies ending with a redundant signature <p>...</p>
     if "<" in body:
@@ -105,15 +158,8 @@ def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -
                 for part in re.split(r"<br\s*/?>|\n", m.group(1), flags=re.IGNORECASE)
             ]
             non_empty = [ln for ln in inner_lines if ln]
-            if (
-                non_empty
-                and all(
-                    ln.lower().rstrip(",.!") in known_tail_lines
-                    or ln.lower().rstrip(",.!") in signoffs
-                    for ln in non_empty
-                )
-                and any(ln.lower().rstrip(",.!") in known_tail_lines for ln in non_empty)
-            ):
+            flags = [_is_tail_line(ln) for ln in non_empty]
+            if non_empty and all(ok for ok, _ in flags) and any(is_sig for _, is_sig in flags):
                 cleaned = cleaned[: m.start()].rstrip()
             else:
                 break
@@ -127,11 +173,11 @@ def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -
         if not cur:
             idx -= 1
             continue
-        cur_norm = cur.lower().rstrip(",.!")
-        if cur_norm in known_tail_lines:
+        ok, is_sig = _is_tail_line(cur)
+        if ok and is_sig:
             idx -= 1
             matched += 1
-        elif matched > 0 and cur_norm in signoffs:
+        elif ok and matched > 0:
             idx -= 1
         else:
             break
@@ -188,9 +234,11 @@ def wrap_branded_email_html(
         paragraphs = [p.strip() for p in body_content.split("\n\n") if p.strip()]
         body_content = "".join(
             f'<p style="margin:0 0 14px 0;line-height:1.55;">'
-            f"{html_lib.escape(p).replace(chr(10), '<br>')}</p>"
+            f"{_linkify_plain_text_escaped(html_lib.escape(p), accent).replace(chr(10), '<br>')}</p>"
             for p in paragraphs
         )
+    else:
+        body_content = _linkify_html_fragment(body_content, accent)
 
     signature_section = ""
     if safe_signature_html or safe_sender:

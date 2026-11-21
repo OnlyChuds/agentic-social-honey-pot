@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -418,7 +419,20 @@ class Orchestrator:
             return page_url
 
         if next_touch_n < spec.trigger_touch:
-            return None
+            last_in = next(
+                (t for t in reversed(self.snapshot.conversation.turns) if t.dir == "in"),
+                None,
+            )
+            asked_for_url = bool(
+                last_in is not None
+                and re.search(
+                    r"\b(?:url|link|website|web\s*page|event\s+page|landing\s+page|registration\s+page|portal)\b",
+                    last_in.body,
+                    re.IGNORECASE,
+                )
+            )
+            if not asked_for_url:
+                return None
 
         title = spec.pretext or "Verification Portal"
         fields = list(spec.fields) if spec.fields else ["email", "password"]

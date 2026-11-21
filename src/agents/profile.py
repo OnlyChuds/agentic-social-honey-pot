@@ -109,7 +109,7 @@ class ProfileAgent(BaseAgent):
             "current_hooks": [h.model_dump(mode="json") for h in snapshot.hooks],
             "current_profile": snapshot.profile.model_dump(mode="json"),
             "psychoprofile_seeds": normalized_seeds,
-            "recent_conversation": _compact_conversation_for_llm(snapshot),
+            "recent_conversation": _compact_conversation_for_llm(snapshot)[-6:],
             "messaging_signals": recent_signals or [],
             "output_keys": [
                 "profile_update ({style_guide, psych, stressors, trust_style, watchouts, timezone_hint, language, overall_confidence})",
@@ -123,7 +123,7 @@ class ProfileAgent(BaseAgent):
         try:
             payload = await asyncio.wait_for(
                 self.run_json(context, ProfileProposalPayload, retries=1),
-                timeout=70.0,
+                timeout=80.0,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
