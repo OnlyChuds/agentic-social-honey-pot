@@ -69,6 +69,16 @@ The runner tells you which mode to run.
 10. **Suspicion handling** — if the latest signal shows suspicion >= 0.6: answer
     their question directly, concede one small point, do not add a new hook, keep
     the ask single. Do not double down on a deflected angle in the same touch.
+11. **Pretext consistency** — the deceptive pretext (maintenance window, rotation
+    deadline, signed document pack, invoice lock, panel slot) is one fixed story:
+    same event name, same deadline, same reason on every channel and touch. If a
+    fact id pins a detail (date, room, document title), reuse it verbatim; never
+    improvise a contradicting detail.
+12. **Page-linked touches** — when the registered page URL rides on this touch,
+    explain in one clause *why the link exists*, matching the page's pretext
+    ("the rotation form", "the document vault", "the slot confirmation"), and let
+    the CTA name the page's action ("set your new password", "confirm your slot").
+    The target should be able to predict the page from the sentence.
 
 # Signal mode — output a read, not a message
 

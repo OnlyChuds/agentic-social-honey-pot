@@ -11,8 +11,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.base import BaseAgent
-from src.agents.landing_pages import PageArtifactSpec
-from src.agents.qa import check_domain_blocklist
+from src.agents.domains import derive_sender_email, ensure_lookalike_domain
+from src.agents.landing_pages import PageArtifactSpec, render_landing_page
+from src.agents.qa import (
+    DEFAULT_BLOCKED_ROOT_DOMAINS,
+    check_domain_blocklist,
+    extract_domain,
+    is_domain_blocked,
+)
 from src.llm.image import IMAGE_TOOL_SCHEMAS, ImageClient, make_image_tool_handlers
 from src.llm.text import TextLLMClient
 from src.models import (
@@ -230,89 +236,6 @@ def wrap_branded_email_html(
     )
 
 
-def render_branded_landing_page_html(
-    manifest: BrandingManifest,
-    spec: LandingPageSpec,
-) -> str:
-    """Assemble a compact, self-contained HTML form page using manifest branding."""
-    primary = _safe_hex_color(manifest.palette[0], "#1f2937") if manifest.palette else "#1f2937"
-    accent = (
-        _safe_hex_color(manifest.palette[1], "#2563eb")
-        if len(manifest.palette) > 1
-        else "#2563eb"
-    )
-    font_stack = ", ".join(manifest.fonts) if manifest.fonts else "Inter, system-ui, sans-serif"
-    safe_company = html_lib.escape(manifest.company or manifest.sender_name or "Partner Portal")
-    safe_title = html_lib.escape(spec.pretext or f"{safe_company} Sign In")
-    safe_footer = html_lib.escape(
-        manifest.footer_legal or f"{manifest.company or 'Portal'} · {manifest.email}"
-    )
-    logo_block = manifest.logo_svg.strip() if manifest.logo_svg.strip().startswith("<svg") else ""
-    fields = list(spec.fields) if spec.fields else ["email", "password"]
-
-    field_rows: list[str] = []
-    for raw_field in fields:
-        name = html_lib.escape(raw_field.strip() or "field", quote=True)
-        label = html_lib.escape(raw_field.replace("_", " ").strip().title() or "Field")
-        input_type = (
-            "password"
-            if "pass" in raw_field.lower() or "token" in raw_field.lower()
-            else "email"
-            if "email" in raw_field.lower()
-            else "text"
-        )
-        field_rows.append(
-            f'<div style="margin-bottom:14px;">'
-            f'<label for="{name}" style="display:block;font-size:13px;font-weight:500;'
-            f'margin-bottom:5px;color:#374151;">{label}</label>'
-            f'<input id="{name}" name="{name}" type="{input_type}" required '
-            f'style="width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #d1d5db;'
-            f'border-radius:6px;font-size:14px;color:#111827;" />'
-            f"</div>"
-        )
-
-    return (
-        "<!doctype html>"
-        '<html lang="en">'
-        "<head>"
-        '<meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{safe_company} — {safe_title}</title>"
-        "</head>"
-        f'<body style="margin:0;padding:40px 16px;background:#f3f4f6;'
-        f'font-family:{font_stack};color:#111827;">'
-        '<div style="max-width:440px;margin:0 auto;background:#ffffff;'
-        'border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
-        f'<div style="padding:18px 24px;background:{primary};color:#ffffff;'
-        'display:flex;align-items:center;gap:12px;">'
-        + (
-            f'<div style="display:inline-flex;align-items:center;justify-content:center;'
-            f'background:#ffffff;border-radius:6px;padding:4px;line-height:0;">{logo_block}</div>'
-            if logo_block
-            else ""
-        )
-        + f'<div style="font-size:15px;font-weight:600;">{safe_company}</div>'
-        "</div>"
-        f'<div style="height:3px;background:{accent};"></div>'
-        '<div style="padding:24px;">'
-        f'<h1 style="margin:0 0 8px 0;font-size:18px;font-weight:600;">{safe_title}</h1>'
-        '<p style="margin:0 0 20px 0;font-size:13px;color:#4b5563;">'
-        "Enter your details below to continue.</p>"
-        '<form method="post">'
-        f"{''.join(field_rows)}"
-        f'<button type="submit" style="width:100%;padding:10px 14px;background:{accent};'
-        'color:#ffffff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;">'
-        "Continue</button>"
-        "</form>"
-        "</div>"
-        '<footer style="padding:12px 24px;background:#f9fafb;border-top:1px solid #e5e7eb;'
-        f'font-size:11px;color:#6b7280;">{safe_footer}</footer>'
-        "</div>"
-        "</body>"
-        "</html>"
-    )
-
-
 class IdentityAgent(BaseAgent):
     """Typed agent plumbing for BrandingManifest creation, validation, and portrait asset wiring."""
 
@@ -441,6 +364,42 @@ class IdentityAgent(BaseAgent):
         )
         return dict(result) if isinstance(result, dict) else {"result": result}
 
+    @staticmethod
+    def _repair_blocked_domain(
+        manifest: BrandingManifest,
+        real_domains: list[str],
+        *,
+        hint: str | None = None,
+    ) -> bool:
+        """Replace a blocked manifest domain/email with a generated lookalike + derived address.
+
+        Returns True when the manifest was changed (or the email was re-derived onto
+        an already-valid domain). The lookalike comes from the deterministic generator
+        in ``src.agents.domains`` so the result passes ``check_domain_blocklist`` by
+        construction when a candidate exists.
+        """
+        roots = [d for d in real_domains if d.strip()]
+        if not roots:
+            return False
+        current = extract_domain(manifest.domain)
+        real_root = next((d for d in roots if extract_domain(d) != current), roots[0])
+        others = [d for d in roots if d != real_root]
+        safe_domain = ensure_lookalike_domain(
+            manifest.domain,
+            real_root,
+            extra_blocked=others,
+            hint=hint,
+        )
+        if not safe_domain:
+            return False
+        if safe_domain == current:
+            # Domain itself was fine; only the address sat on a blocked root.
+            manifest.email = derive_sender_email(manifest.sender_name, safe_domain)
+            return True
+        manifest.domain = safe_domain
+        manifest.email = derive_sender_email(manifest.sender_name, safe_domain)
+        return True
+
     async def build(
         self,
         snapshot: Snapshot,
@@ -489,18 +448,9 @@ class IdentityAgent(BaseAgent):
                     type(exc).__name__,
                     exc,
                 )
-                fallback_html = render_branded_landing_page_html(
-                    snapshot.identity,
-                    landing_page_spec,
-                )
                 output = IdentityOutput(
                     manifest=snapshot.identity.model_copy(deep=True),
-                    page_html=PageArtifactSpec(
-                        pretext=landing_page_spec.pretext,
-                        title=landing_page_spec.pretext or snapshot.identity.company or "Portal",
-                        html=fallback_html,
-                        fields=list(landing_page_spec.fields) or ["email", "password"],
-                    ),
+                    page_html=render_landing_page(landing_page_spec, snapshot.identity),
                 )
             else:
                 raise
@@ -510,12 +460,7 @@ class IdentityAgent(BaseAgent):
             and landing_page_spec is not None
             and (output.page_html is None or not output.page_html.html.strip())
         ):
-            output.page_html = PageArtifactSpec(
-                pretext=landing_page_spec.pretext,
-                title=landing_page_spec.pretext or output.manifest.company or "Portal",
-                html=render_branded_landing_page_html(output.manifest, landing_page_spec),
-                fields=list(landing_page_spec.fields) or ["email", "password"],
-            )
+            output.page_html = render_landing_page(landing_page_spec, output.manifest)
 
         # Preserve existing manifest branding/portrait fields on update/page/revise if omitted
         if snapshot.identity is not None:
@@ -542,12 +487,40 @@ class IdentityAgent(BaseAgent):
                 if not cur.fonts and prev.fonts:
                     cur.fonts = list(prev.fonts)
 
-        # Validate domain compliance against real-root-domain blocklist
+        # Validate domain compliance against real-root-domain blocklist; when the
+        # manifest lands on a blocked root, repair it with the lookalike generator
+        # (offensive half of qa.check_domain_blocklist) before failing.
         real_domains = list(extra_blocked_domains)
         if org_branding and isinstance(org_branding.get("real_domain"), str):
             real_domains.append(str(org_branding["real_domain"]))
         domains_to_check = [d for d in (output.manifest.domain, output.manifest.email) if d.strip()]
         domain_issues = check_domain_blocklist(domains_to_check, extra_blocked=real_domains)
+        if domain_issues:
+            # When the block comes from the default blocklist (not caller-supplied
+            # extras), derive the matched real root so the repairer has a base.
+            blocked_pool = {
+                extract_domain(d) for d in (*DEFAULT_BLOCKED_ROOT_DOMAINS, *real_domains) if d.strip()
+            }
+            blocked_pool.discard("")
+            matched_root = is_domain_blocked(output.manifest.domain, blocked_pool)
+            if matched_root is None:
+                matched_root = is_domain_blocked(output.manifest.email, blocked_pool)
+            repair_roots = [matched_root] if matched_root else list(real_domains)
+            repaired = self._repair_blocked_domain(
+                output.manifest,
+                repair_roots,
+                hint=landing_page_spec.pretext if landing_page_spec is not None else None,
+            )
+            if repaired:
+                logger.info(
+                    "Repaired blocked identity domain to %s (email %s).",
+                    output.manifest.domain,
+                    output.manifest.email,
+                )
+                domains_to_check = [
+                    d for d in (output.manifest.domain, output.manifest.email) if d.strip()
+                ]
+                domain_issues = check_domain_blocklist(domains_to_check, extra_blocked=real_domains)
         if domain_issues and strict_domain_check:
             details = "; ".join(issue.fix for issue in domain_issues)
             raise ValueError(f"Identity manifest failed domain validation: {details}")
