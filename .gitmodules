@@ -1,3 +1,0 @@
-[submodule "vendor/osint-skill"]
-	path = vendor/osint-skill
-	url = https://github.com/smixs/osint-skill
