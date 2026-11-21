@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Literal
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+
+from src.models import utc_now_iso
+from src.store.db import Store
+from src.web.demo_seed import seed_demo_data
+from src.web.queries import get_snapshot_at_version, get_target_detail, list_targets
+from src.web.runner import RunManager
+
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+ASSET_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+class LaunchRunRequest(BaseModel):
+    target_id: str
+    mode: Literal["mock_stub", "practice_live"] = "mock_stub"
+    stub_objective: Literal["credentials", "action", "disclosure"] = "credentials"
+    zero_pacing: bool = True
+    aggressive: bool = False
+    scenario: str = "practice"
+
+
+def _resolve_db_path(data_dir: Path, run_id: str) -> Path:
+    if not RUN_ID_RE.match(run_id):
+        raise HTTPException(status_code=400, detail=f"Invalid run_id: {run_id!r}")
+    base_dir = data_dir.resolve()
+    candidate = (base_dir / f"{run_id}.db").resolve()
+    if candidate.parent != base_dir:
+        raise HTTPException(status_code=400, detail="Invalid run_id path")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    return candidate
+
+
+def _compute_stream_fingerprint(
+    data_dir: Path,
+    run_manager: RunManager,
+) -> tuple[Any, ...]:
+    files_state: list[tuple[str, int, int]] = []
+    if data_dir.exists():
+        for pattern in ("*.db", "*.db-wal", "*.db-shm"):
+            for entry in sorted(data_dir.glob(pattern)):
+                try:
+                    st = entry.stat()
+                    files_state.append((entry.name, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    continue
+    runs_state = tuple(
+        (str(r["run_id"]), str(r["status"]), r["returncode"])
+        for r in run_manager.list_runs()
+    )
+    return (tuple(files_state), runs_state)
+
+
+def create_app(
+    data_dir: Path,
+    run_manager: RunManager | None = None,
+) -> FastAPI:
+    """Create the Target Intelligence & Campaign Monitor FastAPI application."""
+    resolved_dir = Path(data_dir)
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    manager = run_manager if run_manager is not None else RunManager(resolved_dir)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            manager.shutdown()
+
+    app = FastAPI(
+        title="Target Intelligence & Campaign Monitor API",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.data_dir = resolved_dir
+    app.state.run_manager = manager
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/api/targets")
+    async def api_list_targets() -> dict[str, Any]:
+        return list_targets(resolved_dir, running_run_ids=manager.running_ids())
+
+    @app.get("/api/targets/{run_id}")
+    async def api_get_target(run_id: str) -> dict[str, Any]:
+        db_path = _resolve_db_path(resolved_dir, run_id)
+        try:
+            return get_target_detail(db_path, is_running=run_id in manager.running_ids())
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/targets/{run_id}/snapshot/{version}")
+    async def api_get_snapshot(run_id: str, version: int) -> dict[str, Any]:
+        db_path = _resolve_db_path(resolved_dir, run_id)
+        snap = get_snapshot_at_version(db_path, version)
+        if snap is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Snapshot version {version} not found for {run_id}",
+            )
+        return snap
+
+    @app.get("/api/targets/{run_id}/assets/{asset_id}")
+    async def api_get_asset(run_id: str, asset_id: str) -> FileResponse:
+        db_path = _resolve_db_path(resolved_dir, run_id)
+        if not ASSET_ID_RE.match(asset_id) or ".." in asset_id:
+            raise HTTPException(status_code=400, detail=f"Invalid asset_id: {asset_id!r}")
+        with Store(db_path) as store:
+            asset = store.get_asset(asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
+        local_file = Path(asset.local_path)
+        if not local_file.is_file():
+            raise HTTPException(status_code=404, detail=f"Asset file missing on disk: {asset_id}")
+        return FileResponse(path=local_file, media_type=asset.content_type)
+
+    @app.post("/api/runs/launch")
+    async def api_launch_run(req: LaunchRunRequest) -> dict[str, Any]:
+        if req.scenario != "practice":
+            raise HTTPException(
+                status_code=400,
+                detail="Only 'practice' scenario runs can be launched from the dashboard.",
+            )
+        try:
+            info = manager.launch(
+                target_id=req.target_id,
+                mode=req.mode,
+                stub_objective=req.stub_objective,
+                zero_pacing=req.zero_pacing,
+                aggressive=req.aggressive,
+                scenario=req.scenario,
+                data_dir=resolved_dir,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return info.to_dict()
+
+    @app.post("/api/runs/{run_id}/stop")
+    async def api_stop_run(run_id: str) -> dict[str, Any]:
+        if not RUN_ID_RE.match(run_id):
+            raise HTTPException(status_code=400, detail=f"Invalid run_id: {run_id!r}")
+        stopped = manager.stop(run_id)
+        return {"run_id": run_id, "stopped": stopped}
+
+    @app.get("/api/runs/active")
+    async def api_active_runs() -> dict[str, Any]:
+        return {
+            "runs": manager.list_runs(),
+            "running_ids": sorted(manager.running_ids()),
+        }
+
+    @app.get("/api/stream")
+    async def api_stream(request: Request) -> StreamingResponse:
+        async def _event_stream() -> AsyncIterator[str]:
+            last_fp = _compute_stream_fingerprint(resolved_dir, manager)
+            last_ping = time.monotonic()
+            initial_payload = json.dumps({"type": "update", "ts": utc_now_iso()})
+            yield f"data: {initial_payload}\n\n"
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    await asyncio.sleep(0.5)
+                    current_fp = _compute_stream_fingerprint(resolved_dir, manager)
+                    if current_fp != last_fp:
+                        last_fp = current_fp
+                        last_ping = time.monotonic()
+                        payload = json.dumps({"type": "update", "ts": utc_now_iso()})
+                        yield f"data: {payload}\n\n"
+                    elif time.monotonic() - last_ping >= 15.0:
+                        last_ping = time.monotonic()
+                        yield ": ping\n\n"
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return app
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run the Target Intelligence & Campaign Monitor FastAPI backend."
+    )
+    parser.add_argument("--data-dir", default="data", help="Directory containing campaign *.db files")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
+    parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    parser.add_argument(
+        "--seed-demo",
+        action="store_true",
+        help="Seed the 3 demo practice databases before starting the server",
+    )
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir)
+    if args.seed_demo:
+        seed_demo_data(data_dir)
+
+    app = create_app(data_dir)
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
