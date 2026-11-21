@@ -392,7 +392,7 @@ def discover_agents(
             image_client=image_client,
             assets_dir=assets_dir,
         ),
-        strategy=_try_load_agent("src.agents.strategy", "StrategyAgent", llm),
+        strategy=_try_load_agent("src.agents.strategy", "StrategyAgent", llm, config=cfg),
         messaging=_try_load_agent("src.agents.messaging", "MessagingAgent", llm),
         qa=_try_load_agent(
             "src.agents.qa",
