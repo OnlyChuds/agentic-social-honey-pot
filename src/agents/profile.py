@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -17,6 +19,8 @@ from src.models import (
     PsychTrait,
     Snapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class HookUpdate(BaseModel):
@@ -116,7 +120,28 @@ class ProfileAgent(BaseAgent):
             ],
         }
 
-        payload = await self.run_json(context, ProfileProposalPayload)
+        try:
+            payload = await asyncio.wait_for(
+                self.run_json(context, ProfileProposalPayload, retries=1),
+                timeout=70.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Profile LLM call failed (%s: %s); falling back to conservative profile.",
+                type(exc).__name__,
+                exc,
+            )
+            fallback_prof = snapshot.profile.model_copy(deep=True)
+            if not fallback_prof.style_guide:
+                fallback_prof.style_guide = "concise, direct, peer-level"
+            if not fallback_prof.trust_style:
+                fallback_prof.trust_style = "concrete shared context and verifiable specifics"
+            if fallback_prof.overall_confidence < 0.55 and active_facts:
+                fallback_prof.overall_confidence = 0.6
+            payload = ProfileProposalPayload(
+                profile_update=fallback_prof,
+                rationale=f"Fallback profile after {type(exc).__name__}",
+            )
         payload = _enforce_profile_invariants(payload, snapshot)
 
         rationale = payload.rationale or (

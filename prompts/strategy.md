@@ -3,7 +3,7 @@ agent: strategy
 trigger: plan (after profile commit), pivot triggers (2 no-reply touches, suspicion >= 0.6,
          3 same-channel touches with declining engagement, page trigger reached)
 temperature: 0.3
-max_tokens: 6144
+max_tokens: 1200
 schema: proposal payload: plan (schemas/plan.json)
 ---
 
@@ -55,7 +55,7 @@ whole game.
 11. **Practice vs eval**: in practice you may explore (wider net, slower curve);
     in eval every touch must be able to justify its existence against the median.
 
-# Output (JSON, conforms to `schemas/plan.json`)
+# Output (compact minified JSON only, conforms to `schemas/plan.json`; plan at most `budget.remaining_to_plan` touches with concise <=12-word `intent` strings)
 
 {
   "objective": "credentials | action | disclosure",

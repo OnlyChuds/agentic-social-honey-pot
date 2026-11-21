@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from src.agents.base import BaseAgent
+from src.agents.messaging import _compact_manifest_for_llm
 from src.config import AppConfig
 from src.llm.text import TextLLMClient
-from src.models import Actor, CampaignPlan, Proposal, ProposalKind, Snapshot
+from src.models import (
+    Actor,
+    CampaignPlan,
+    LandingPageSpec,
+    Proposal,
+    ProposalKind,
+    Snapshot,
+    TouchSpec,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _highest_seen_escalation(snapshot: Snapshot) -> int:
@@ -155,7 +168,7 @@ class StrategyAgent(BaseAgent):
             )
             max_touches = min(remaining, cap)
         else:
-            max_touches = remaining
+            max_touches = min(remaining, 10)
 
         ranked_hooks = sorted(
             [h for h in snapshot.hooks if h.status != "exhausted"],
@@ -185,7 +198,7 @@ class StrategyAgent(BaseAgent):
             "active_facts": [
                 f.model_dump(mode="json") for f in snapshot.facts if f.status == "active"
             ],
-            "identity": snapshot.identity.model_dump(mode="json") if snapshot.identity else None,
+            "identity": _compact_manifest_for_llm(snapshot.identity),
             "previous_plan": (
                 snapshot.campaign.plan.model_dump(mode="json") if snapshot.campaign.plan else None
             ),
@@ -203,43 +216,87 @@ class StrategyAgent(BaseAgent):
         }
 
         messages = self.build_messages(context)
-        plan = await self.llm.complete_json(
-            messages,
-            CampaignPlan,
-            temperature=self.prompt.temperature,
-            max_tokens=self.prompt.max_tokens,
-        )
-
-        violations = validate_campaign_plan(
-            plan, snapshot, max_touches=max_touches, pivot_reason=pivot_reason
-        )
-        for _ in range(max_repairs):
-            if not violations:
-                break
-            repair_messages = [
-                *messages,
-                {"role": "assistant", "content": plan.model_dump_json()},
-                {
-                    "role": "user",
-                    "content": (
-                        "Your plan violated hard campaign constraints:\n"
-                        + "\n".join(f"- {v}" for v in violations)
-                        + "\nReturn a corrected JSON CampaignPlan fixing every violation."
-                    ),
-                },
-            ]
-            plan = await self.llm.complete_json(
-                repair_messages,
-                CampaignPlan,
-                temperature=0.2,
-                max_tokens=self.prompt.max_tokens,
+        try:
+            plan = await asyncio.wait_for(
+                self.llm.complete_json(
+                    messages,
+                    CampaignPlan,
+                    temperature=self.prompt.temperature,
+                    max_tokens=self.prompt.max_tokens,
+                    retries=1,
+                ),
+                timeout=85.0,
             )
+
             violations = validate_campaign_plan(
                 plan, snapshot, max_touches=max_touches, pivot_reason=pivot_reason
             )
+            for _ in range(max_repairs):
+                if not violations:
+                    break
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": plan.model_dump_json()},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your plan violated hard campaign constraints:\n"
+                            + "\n".join(f"- {v}" for v in violations)
+                            + "\nReturn a corrected compact JSON CampaignPlan fixing every violation."
+                        ),
+                    },
+                ]
+                plan = await asyncio.wait_for(
+                    self.llm.complete_json(
+                        repair_messages,
+                        CampaignPlan,
+                        temperature=0.2,
+                        max_tokens=self.prompt.max_tokens,
+                        retries=0,
+                    ),
+                    timeout=65.0,
+                )
+                violations = validate_campaign_plan(
+                    plan, snapshot, max_touches=max_touches, pivot_reason=pivot_reason
+                )
 
-        if violations:
-            plan = _clamp_plan_to_budget(plan, snapshot, max_touches)
+            if violations:
+                plan = _clamp_plan_to_budget(plan, snapshot, max_touches)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Strategy LLM call failed (%s: %s); building deterministic fallback plan.",
+                type(exc).__name__,
+                exc,
+            )
+            top_hook = ranked_hooks[0].hook_id if ranked_hooks else ""
+            start_n = used + 1
+            count = max(1, min(max_touches, 5))
+            base_esc = max(1, _highest_seen_escalation(snapshot))
+            touches = [
+                TouchSpec(
+                    n=start_n + i,
+                    channel="email",
+                    intent=f"Grounded outreach step {start_n + i} using top hook",
+                    hook=top_hook,
+                    escalation=min(5, max(base_esc, i + 1)),
+                    stop_if="explicit decline or high suspicion",
+                )
+                for i in range(count)
+            ]
+            trigger_n = min(start_n + count - 1, start_n + 2)
+            plan = CampaignPlan(
+                objective="credentials",
+                primary_hook=top_hook,
+                touches=touches,
+                landing_page=LandingPageSpec(
+                    pretext="Partner Portal Verification",
+                    fields=["email", "password"],
+                    trigger_touch=trigger_n,
+                    url_path="/partner-portal",
+                ),
+                pivot_triggers=["2 touches no reply", "suspicion >= 0.6"],
+                give_up=f"touch {start_n + count - 1}",
+            )
 
         rationale = (
             f"Planned {len(plan.touches)} touches (objective={plan.objective}, "
