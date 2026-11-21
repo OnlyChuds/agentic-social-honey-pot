@@ -105,6 +105,63 @@ class TextLLMClient:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
+    def _is_openai_hosted(self) -> bool:
+        url = self.base_url.lower()
+        return "api.openai.com" in url or "openai.azure.com" in url
+
+    def _is_openai_reasoning_or_nextgen_model(self) -> bool:
+        model = self.model.strip().lower()
+        # Handle optional provider prefix like "openai/gpt-6"
+        if "/" in model:
+            model = model.rsplit("/", 1)[-1]
+        return model.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6"))
+
+    def _is_vllm_qwen_model(self) -> bool:
+        if self._is_openai_hosted():
+            return False
+        model = self.model.strip().lower()
+        if "/" in model:
+            model = model.rsplit("/", 1)[-1]
+        return not model.startswith(("gpt-", "o1", "o3", "o4", "claude-", "gemini-"))
+
+    def _build_completion_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+        enable_thinking: bool = False,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        json_mode: bool = False,
+    ) -> dict[str, Any]:
+        is_openai = self._is_openai_hosted()
+        is_nextgen = self._is_openai_reasoning_or_nextgen_model()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(list[ChatCompletionMessageParam], messages),
+        }
+        if is_openai or is_nextgen:
+            kwargs["max_completion_tokens"] = max(max_tokens, 8192) if is_nextgen else max_tokens
+            if not is_nextgen:
+                kwargs["temperature"] = temperature
+        else:
+            kwargs["temperature"] = temperature
+            kwargs["max_tokens"] = max_tokens
+            if self._is_vllm_qwen_model():
+                kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": enable_thinking}
+                }
+        if tools:
+            kwargs["tools"] = cast(list[ChatCompletionToolParam], tools)
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+        return kwargs
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -116,21 +173,15 @@ class TextLLMClient:
         tool_choice: str | dict[str, Any] | None = None,
         json_mode: bool = False,
     ) -> TextCompletion:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": cast(list[ChatCompletionMessageParam], messages),
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-        }
-        if tools:
-            kwargs["tools"] = cast(list[ChatCompletionToolParam], tools)
-            if tool_choice is not None:
-                kwargs["tool_choice"] = tool_choice
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
+        kwargs = self._build_completion_kwargs(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            tools=tools,
+            tool_choice=tool_choice,
+            json_mode=json_mode,
+        )
 
         stream = await self._client.chat.completions.create(**kwargs)
         content_parts: list[str] = []

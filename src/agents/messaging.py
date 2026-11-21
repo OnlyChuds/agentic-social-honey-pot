@@ -70,6 +70,12 @@ _CLICHE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("assistant exclamation", re.compile(r"\b(?:certainly|absolutely)!", re.IGNORECASE)),
 )
 _BULLET_LINE_RE = re.compile(r"^\s*(?:[-*•]|\d+\.)\s+", re.MULTILINE)
+_PHANTOM_ATTACHMENT_RE = re.compile(
+    r"\b(?:see\s+attached|i(?:'ve|’ve|\s+have)?\s+attached|attached\s+(?:is|are|here|below))\b",
+    re.IGNORECASE,
+)
+_SUBJECT_BODY_LEAK_RE = re.compile(r"\b(?:hi|hello|hey)\s+[A-Z][a-z]+,", re.IGNORECASE)
+SUBJECT_MAX_CHARS = 90
 
 
 class StoryClock:
@@ -316,6 +322,17 @@ def enforce_channel_limits(draft: MessageDraft) -> tuple[MessageDraft, list[str]
         updated.body = _trim_at_word_boundary(updated.body, LIVE_TURN_MAX_CHARS)
         warnings.append(f"Trimmed live turn body to <= {LIVE_TURN_MAX_CHARS} chars.")
 
+    if updated.subject is not None:
+        cleaned_subj = re.sub(r"\s+", " ", updated.subject).strip()
+        leak_match = _SUBJECT_BODY_LEAK_RE.search(cleaned_subj)
+        if leak_match and leak_match.start() > 0:
+            cleaned_subj = cleaned_subj[: leak_match.start()].strip(" -:;,")
+            warnings.append("Stripped leaked greeting/body text from email subject.")
+        if len(cleaned_subj) > SUBJECT_MAX_CHARS:
+            cleaned_subj = _trim_at_word_boundary(cleaned_subj, SUBJECT_MAX_CHARS).rstrip(".")
+            warnings.append(f"Trimmed email subject to <= {SUBJECT_MAX_CHARS} chars.")
+        updated.subject = cleaned_subj
+
     if updated.channel in SUBJECT_REQUIRED_CHANNELS and not (
         updated.subject and updated.subject.strip()
     ):
@@ -343,6 +360,20 @@ def lint_message_style(draft: MessageDraft) -> list[str]:
     if draft.channel in CHAT_AND_LIVE_CHANNELS and _BULLET_LINE_RE.search(draft.body):
         issues.append(
             f"Remove markdown/bullet list formatting from chat/live channel '{draft.channel}'."
+        )
+
+    if draft.subject:
+        subj_clean = re.sub(r"\s+", " ", draft.subject).strip()
+        if len(subj_clean) > 100 or _SUBJECT_BODY_LEAK_RE.search(subj_clean):
+            issues.append(
+                "Subject line looks corrupted or contains email body text — "
+                "use a crisp 3-8 word subject line only."
+            )
+
+    if not draft.attachments and _PHANTOM_ATTACHMENT_RE.search(draft.body):
+        issues.append(
+            "Body claims an attachment is included, but `attachments` is empty — "
+            "either include a concrete attachment or remove the 'attached' wording."
         )
 
     for meta_issue in check_disallowed_meta_text(combined):

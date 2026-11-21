@@ -620,11 +620,14 @@ class Orchestrator:
         raw_channel = str(msg_prop.payload.get("channel") or touch_spec.channel)
         body = str(msg_prop.payload.get("say") or msg_prop.payload.get("body") or "")
         if self.policy.needs_qa(raw_channel, body, is_landing_page=False):
+            revised_meta: dict[str, Any] = {}
+
             async def _revise_msg(verdict: QAVerdict, _prev: str) -> str | None:
                 rev = await self._safe_run_agent(
                     "messaging",
                     self.agents.messaging,
                     mode="compose",
+                    channel=touch_spec.channel,
                     touch=touch_spec.model_dump(mode="json"),
                     registered_page_url=registered_url,
                     latest_signal=self._last_signal_payload,
@@ -632,6 +635,12 @@ class Orchestrator:
                 )
                 if rev is None:
                     return None
+                if rev.payload.get("subject") is not None:
+                    revised_meta["subject"] = rev.payload["subject"]
+                if "attachments" in rev.payload:
+                    revised_meta["attachments"] = rev.payload["attachments"]
+                if "facts_used" in rev.payload:
+                    revised_meta["facts_used"] = rev.payload["facts_used"]
                 return str(rev.payload.get("body") or "")
 
             revised_body, msg_verdict, blocked_by_rule = await self._run_qa_gate(
@@ -668,6 +677,9 @@ class Orchestrator:
                 )
                 return self.snapshot
             msg_prop.payload["body"] = revised_body
+            for meta_key in ("subject", "attachments", "facts_used"):
+                if meta_key in revised_meta:
+                    msg_prop.payload[meta_key] = revised_meta[meta_key]
             msg_prop.base_version = self.snapshot.version
 
         # Validate message proposal before spending a touch (retry compose once with feedback)
@@ -997,6 +1009,7 @@ class Orchestrator:
                 mode="pivot",
                 reason=pivot_reason,
             )
+            self.policy.mark_strategy_pivoted()
             if strat_prop is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(strat_prop)]))
                 await self._maybe_restart_session(actions)

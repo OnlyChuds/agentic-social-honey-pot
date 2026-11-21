@@ -26,6 +26,7 @@ class PolicyState:
     recent_engagements: list[float] = field(default_factory=list)
     last_engagement: float = 0.0
     last_suspicion: float = 0.0
+    suspicion_pivoted: bool = False
     last_touch_monotonic: float | None = None
 
     def reset_for_new_session(self) -> None:
@@ -37,6 +38,7 @@ class PolicyState:
         self.recent_engagements.clear()
         self.last_engagement = 0.0
         self.last_suspicion = 0.0
+        self.suspicion_pivoted = False
         self.last_touch_monotonic = None
 
 
@@ -112,6 +114,7 @@ class TriggerPolicy:
     def record_signal(self, *, engagement: float, suspicion: float) -> None:
         self.state.last_engagement = engagement
         self.state.last_suspicion = suspicion
+        self.state.suspicion_pivoted = False
         self.state.recent_engagements.append(engagement)
         if len(self.state.recent_engagements) > 5:
             self.state.recent_engagements = self.state.recent_engagements[-5:]
@@ -121,6 +124,9 @@ class TriggerPolicy:
 
     def mark_osint_refreshed(self) -> None:
         self.state.osint_refreshes_this_session += 1
+
+    def mark_strategy_pivoted(self) -> None:
+        self.state.suspicion_pivoted = True
 
     # --- Trigger Decisions ---
 
@@ -148,15 +154,25 @@ class TriggerPolicy:
     def strategy_pivot_reason(self, snapshot: Snapshot) -> str | None:
         if snapshot.campaign.plan is None:
             return "no active campaign plan"
-        if self.state.consecutive_no_reply >= self.no_reply_pivot_threshold:
+        if (
+            self.state.consecutive_no_reply >= self.no_reply_pivot_threshold
+            and self.state.consecutive_no_reply % self.no_reply_pivot_threshold == 0
+        ):
             return (
                 f"{self.state.consecutive_no_reply} consecutive touches without reply "
                 f"(threshold={self.no_reply_pivot_threshold})"
             )
-        if self.state.last_suspicion >= self.suspicion_pivot_threshold:
+        if not self.state.suspicion_pivoted and (
+            self.state.last_suspicion >= 0.75
+            or (
+                self.state.last_suspicion >= self.suspicion_pivot_threshold
+                and self.state.last_engagement < 0.5
+            )
+        ):
             return (
                 f"target suspicion {self.state.last_suspicion:.2f} >= "
-                f"{self.suspicion_pivot_threshold:.2f}"
+                f"{self.suspicion_pivot_threshold:.2f} "
+                f"(engagement={self.state.last_engagement:.2f})"
             )
         if self.state.same_channel_streak >= 3 and self._engagement_is_declining():
             return (

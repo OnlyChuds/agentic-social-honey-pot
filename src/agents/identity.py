@@ -68,30 +68,60 @@ def _safe_hex_color(value: str, fallback: str) -> str:
     return cleaned if _SAFE_COLOR_RE.match(cleaned) else fallback
 
 
+_TRAILING_HTML_P_RE = re.compile(r"<p\b[^>]*>((?:(?!</p>)[\s\S])*)</p>\s*$", re.IGNORECASE)
+_INLINE_TAG_RE = re.compile(r"<[^>]+>")
+
+
 def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -> str:
-    """Remove a trailing plain-text copy of ``manifest.signature`` to avoid double signatures."""
+    """Remove trailing duplicate signature/name/footer lines (plain text or trailing HTML <p>)."""
     sig_lines = [line.strip() for line in manifest.signature.splitlines() if line.strip()]
-    if not sig_lines:
+    known_tail_lines = {line.lower() for line in sig_lines}
+    for extra in (manifest.sender_name, manifest.title, manifest.company, manifest.footer_legal):
+        if extra and extra.strip():
+            known_tail_lines.add(extra.strip().lower())
+    if not known_tail_lines:
         return body
 
+    # Handle HTML paragraph bodies ending with a redundant signature <p>...</p>
+    if "<" in body:
+        cleaned = body.rstrip()
+        while True:
+            m = _TRAILING_HTML_P_RE.search(cleaned)
+            if not m:
+                break
+            inner_lines = [
+                html_lib.unescape(_INLINE_TAG_RE.sub("", part)).strip()
+                for part in re.split(r"<br\s*/?>|\n", m.group(1), flags=re.IGNORECASE)
+            ]
+            non_empty = [ln for ln in inner_lines if ln]
+            if non_empty and all(
+                ln.lower().rstrip(",.") in known_tail_lines
+                or ln.lower().rstrip(",.") in {"best", "regards", "best regards", "thanks", "cheers"}
+                for ln in non_empty
+            ) and any(ln.lower().rstrip(",.") in known_tail_lines for ln in non_empty):
+                cleaned = cleaned[: m.start()].rstrip()
+            else:
+                break
+        return cleaned
+
     body_lines = body.rstrip().splitlines()
-    # Strip trailing lines matching manifest signature lines (case-insensitive)
     idx = len(body_lines)
-    sig_idx = len(sig_lines) - 1
     matched = 0
-    while idx > 0 and sig_idx >= 0:
+    while idx > 0:
         cur = body_lines[idx - 1].strip()
         if not cur:
             idx -= 1
             continue
-        if cur.lower() == sig_lines[sig_idx].lower():
+        cur_norm = cur.lower().rstrip(",.")
+        if cur_norm in known_tail_lines:
             idx -= 1
-            sig_idx -= 1
             matched += 1
+        elif matched > 0 and cur_norm in {"best", "regards", "best regards", "thanks", "cheers"}:
+            idx -= 1
         else:
             break
 
-    if matched >= max(2, len(sig_lines) - 1) or (len(sig_lines) == 1 and matched == 1):
+    if matched >= 1:
         return "\n".join(body_lines[:idx]).rstrip()
     return body
 
@@ -134,9 +164,8 @@ def wrap_branded_email_html(
             f"</td>"
         )
 
-    body_content = body_html.strip()
+    body_content = _strip_duplicate_trailing_signature(body_html.strip(), manifest)
     if "<" not in body_content:
-        body_content = _strip_duplicate_trailing_signature(body_content, manifest)
         paragraphs = [p.strip() for p in body_content.split("\n\n") if p.strip()]
         body_content = "".join(
             f'<p style="margin:0 0 14px 0;line-height:1.55;">'
@@ -181,8 +210,13 @@ def wrap_branded_email_html(
         'border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">'
         f'<div style="padding:18px 28px;background:{primary};color:#ffffff;'
         'display:flex;align-items:center;gap:12px;">'
-        f'<div style="display:inline-block;vertical-align:middle;">{logo_block}</div>'
-        f'<div style="font-size:15px;font-weight:600;letter-spacing:0.01em;">{safe_company}</div>'
+        + (
+            f'<div style="display:inline-flex;align-items:center;justify-content:center;'
+            f'background:#ffffff;border-radius:6px;padding:4px;line-height:0;">{logo_block}</div>'
+            if logo_block
+            else ""
+        )
+        + f'<div style="font-size:15px;font-weight:600;letter-spacing:0.01em;">{safe_company}</div>'
         "</div>"
         f'<div style="height:3px;background:{accent};"></div>'
         '<div style="padding:24px 28px;font-size:14px;color:#1f2937;">'
@@ -251,8 +285,13 @@ def render_branded_landing_page_html(
         'border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">'
         f'<div style="padding:18px 24px;background:{primary};color:#ffffff;'
         'display:flex;align-items:center;gap:12px;">'
-        f"<div>{logo_block}</div>"
-        f'<div style="font-size:15px;font-weight:600;">{safe_company}</div>'
+        + (
+            f'<div style="display:inline-flex;align-items:center;justify-content:center;'
+            f'background:#ffffff;border-radius:6px;padding:4px;line-height:0;">{logo_block}</div>'
+            if logo_block
+            else ""
+        )
+        + f'<div style="font-size:15px;font-weight:600;">{safe_company}</div>'
         "</div>"
         f'<div style="height:3px;background:{accent};"></div>'
         '<div style="padding:24px;">'
