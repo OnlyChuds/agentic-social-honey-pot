@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]}`|]+")
-_LINKEDIN_IN_RE = re.compile(r"https?://(?:www\.)?linkedin\.com/in/[A-Za-z0-9_\-]+", re.IGNORECASE)
+_LINKEDIN_IN_RE = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)?linkedin\.com/in/([A-Za-z0-9_%\-]+)",
+    re.IGNORECASE,
+)
 _SOCIAL_HOSTS = (
     "linkedin.com",
     "instagram.com",
@@ -91,22 +94,45 @@ def _name_tokens(name: str) -> set[str]:
     return {tok for tok in re.findall(r"[a-z]+", name.lower()) if len(tok) > 2}
 
 
+def _normalize_linkedin_profile(url: str) -> str | None:
+    """Extract canonical https://www.linkedin.com/in/<slug> from regional or authwall URLs."""
+    candidates = [url]
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        for key in ("sessionRedirect", "redirect", "url"):
+            for val in qs.get(key, []):
+                candidates.append(unquote(val))
+    except ValueError:
+        pass
+
+    for cand in candidates:
+        m = _LINKEDIN_IN_RE.search(cand)
+        if m:
+            slug = unquote(m.group(1)).strip("/")
+            if slug and slug.lower() not in {"authwall", "login", "signup"}:
+                return f"https://www.linkedin.com/in/{slug}"
+    return None
+
+
 def find_linkedin_url(sources: list[Source], name: str) -> str | None:
-    """Pick the LinkedIn profile URL that best matches the target's name."""
+    """Pick the canonical LinkedIn profile URL that best matches the target's name."""
     tokens = _name_tokens(name)
     fallback: str | None = None
     for src in sources:
-        for url in src.urls or ([src.url] if src.url else []):
-            if not _LINKEDIN_IN_RE.match(url):
+        raw_urls = list(src.urls) if src.urls else ([src.url] if src.url else [])
+        for raw in raw_urls:
+            canon = _normalize_linkedin_profile(raw)
+            if not canon:
                 continue
             if fallback is None:
-                fallback = url
-            slug = url.rstrip("/").rsplit("/", 1)[-1].lower()
+                fallback = canon
+            slug = canon.rstrip("/").rsplit("/", 1)[-1].lower()
             title = src.title.lower()
             if any(tok in slug for tok in tokens):
-                return url
+                return canon
             if any(len(tok) > 4 and tok in title for tok in tokens):
-                return url
+                return canon
     return fallback
 
 

@@ -1,8 +1,8 @@
 """Burst-based OSINT engine.
 
 Fixed parallel research stages using native httpx (no bash/curl, no LLM in the loop):
-  burst 1 - multi-provider seed searches, all in parallel (cap ~20s)
-  burst 2 - LinkedIn scrape via Apify + top content-page reads, in parallel (cap ~45s)
+  burst 1 - multi-provider seed searches, all in parallel (cap ~12s)
+  burst 2 - LinkedIn scrape via Apify + top content-page reads, in parallel (cap ~38s)
   burst 3 - optional follow-up reads on URLs discovered in burst 2 (cap ~12s)
 
 The agent makes exactly one LLM call afterwards to synthesize the dossier.
@@ -45,8 +45,8 @@ class OsintEngine:
         tavily_key: str = "",
         apify_token: str = "",
         max_budget_usd: float = 2.0,
-        burst1_s: float = 20.0,
-        burst2_s: float = 45.0,
+        burst1_s: float = 12.0,
+        burst2_s: float = 38.0,
         burst3_s: float = 12.0,
         read_limit_burst2: int = 3,
         read_limit_burst3: int = 2,
@@ -241,24 +241,33 @@ def render_findings(result: OsintResult, *, name: str, org: str, role: str, focu
         f"TIMINGS: bursts={result.timings.get('bursts_s', 0.0):.1f}s budget=${result.budget_usd:.3f}",
         "",
     ]
+    linkedin_sources = [s for s in result.sources if s.kind == "linkedin_scrape" and s.ok and s.text]
+    read_sources = [s for s in result.sources if s.kind == "read" and (s.ok or s.text)]
+    search_sources = [s for s in result.sources if s.kind == "search" and (s.ok or s.text)]
+
+    for s in linkedin_sources:
+        lines.append(f"## [linkedin scrape] {s.url} ({s.elapsed_s:.1f}s)")
+        lines.append(s.text[:4500])
+
+    for s in read_sources:
+        lines.append(f"## [read] {s.url} ({s.elapsed_s:.1f}s) {s.title}".rstrip())
+        lines.append(s.text[:2500])
+
+    seen_search_urls: set[str] = set()
     last_label: str | None = None
-    for s in result.sources:
-        if not s.ok and not s.text:
-            continue
-        if s.kind in ("search",):
-            if s.label != last_label:
-                lines.append(f"## {s.label}")
-                last_label = s.label
-            entry = f"- {s.title} | {s.url}".strip(" |")
-            if s.text:
-                entry += f"\n  {s.text[:300]}"
-            lines.append(entry)
-        elif s.kind == "read":
-            lines.append(f"## [read] {s.url} ({s.elapsed_s:.1f}s) {s.title}".rstrip())
-            lines.append(s.text[:2500])
-        elif s.kind == "linkedin_scrape" and s.ok:
-            lines.append(f"## [linkedin scrape] {s.url} ({s.elapsed_s:.1f}s)")
-            lines.append(s.text[:3500])
+    for s in search_sources:
+        norm_url = s.url.rstrip("/").lower() if s.url else ""
+        if norm_url:
+            if norm_url in seen_search_urls:
+                continue
+            seen_search_urls.add(norm_url)
+        if s.label != last_label:
+            lines.append(f"## {s.label}")
+            last_label = s.label
+        entry = f"- {s.title} | {s.url}".strip(" |")
+        if s.text:
+            entry += f"\n  {s.text[:300]}"
+        lines.append(entry)
     lines.append("")
     lines.append(
         "Provider errors (infra only, ignore unless no data): "
