@@ -555,6 +555,7 @@ class StateManager:
         subject: str | None = None,
         idempotency_key: str = "",
         facts_used: list[str] | None = None,
+        attachments: list[str | dict[str, Any]] | None = None,
         cost_touch: bool = True,
     ) -> Event:
         turn_no = len(self.snapshot.conversation.turns) + 1
@@ -569,6 +570,7 @@ class StateManager:
                 "body": body,
                 "idempotency_key": idempotency_key,
                 "facts_used": facts_used or [],
+                "attachments": list(attachments) if attachments else [],
             },
         )
         self.store.append_event(ev)
