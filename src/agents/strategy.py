@@ -160,6 +160,39 @@ class StrategyAgent(BaseAgent):
             pivot_reason = reason
         used = snapshot.campaign.budget.used
         remaining = max(0, snapshot.campaign.budget.session_max - used)
+        if remaining <= 0:
+            prev_obj = (
+                snapshot.campaign.plan.objective
+                if snapshot.campaign.plan is not None
+                else "disclosure"
+            )
+            prev_hook = (
+                snapshot.campaign.plan.primary_hook
+                if snapshot.campaign.plan is not None
+                else ""
+            )
+            can_restart = snapshot.sessions.used < snapshot.sessions.allowed
+            done_plan = CampaignPlan(
+                objective=prev_obj,
+                primary_hook=prev_hook,
+                touches=[],
+                give_up="Session touch budget exhausted.",
+            )
+            done_plan.session_restart.recommended = can_restart
+            done_plan.session_restart.reason = (
+                "Session touch budget exhausted without incident; restart fresh session."
+                if can_restart
+                else None
+            )
+            return self.make_proposal(
+                snapshot,
+                done_plan.model_dump(mode="json"),
+                rationale=(
+                    "Budget exhausted (0 touches remaining); "
+                    + ("recommended fresh session restart." if can_restart else "ending run.")
+                ),
+            )
+
         if aggressive:
             cap = (
                 self.config.aggressive.budget.compressed_plan_touches
@@ -179,6 +212,19 @@ class StrategyAgent(BaseAgent):
         tried_channels = [
             {"n": t.n, "channel": t.channel, "dir": t.dir} for t in snapshot.conversation.turns
         ]
+        prev_plan = snapshot.campaign.plan
+        previous_primary_hook = prev_plan.primary_hook if prev_plan is not None else None
+        tried_hooks_in_session = sorted(
+            {
+                t.hook
+                for t in (prev_plan.touches if prev_plan is not None else [])
+                if t.hook and t.n <= used
+            }
+            | ({previous_primary_hook} if previous_primary_hook and used > 0 else set())
+        )
+        unused_active_hooks = [
+            h.hook_id for h in ranked_hooks if h.hook_id not in tried_hooks_in_session
+        ]
 
         context: dict[str, Any] = {
             "run": snapshot.run.model_dump(mode="json"),
@@ -194,6 +240,9 @@ class StrategyAgent(BaseAgent):
             "highest_seen_escalation": _highest_seen_escalation(snapshot),
             "ranked_active_hooks": [h.model_dump(mode="json") for h in ranked_hooks],
             "exhausted_hooks_DO_NOT_USE": exhausted_hooks,
+            "previous_primary_hook": previous_primary_hook,
+            "tried_hooks_in_session": tried_hooks_in_session,
+            "prefer_unused_hooks_on_pivot": unused_active_hooks,
             "profile": snapshot.profile.model_dump(mode="json"),
             "active_facts": [
                 f.model_dump(mode="json") for f in snapshot.facts if f.status == "active"

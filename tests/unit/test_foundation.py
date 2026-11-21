@@ -154,6 +154,42 @@ async def test_text_client_json_retry_and_tool_loop() -> None:
     await llm.aclose()
 
 
+def test_text_client_openai_and_vllm_request_kwargs() -> None:
+    msgs = [{"role": "user", "content": "hi"}]
+
+    qwen = TextLLMClient(
+        base_url="https://vllm.example/v1",
+        api_key="k",
+        model="Qwen3.8-27B-abliterated",
+    )
+    qwen_kw = qwen._build_completion_kwargs(msgs, temperature=0.2, max_tokens=2048)
+    assert qwen_kw["max_tokens"] == 2048
+    assert qwen_kw["temperature"] == 0.2
+    assert qwen_kw["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    gpt6 = TextLLMClient(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        model="gpt-6",
+    )
+    gpt6_kw = gpt6._build_completion_kwargs(msgs, temperature=0.2, max_tokens=2048, json_mode=True)
+    assert gpt6_kw["max_completion_tokens"] == 8192
+    assert "max_tokens" not in gpt6_kw
+    assert "temperature" not in gpt6_kw
+    assert "extra_body" not in gpt6_kw
+    assert gpt6_kw["response_format"] == {"type": "json_object"}
+
+    gpt41 = TextLLMClient(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        model="gpt-4.1",
+    )
+    gpt41_kw = gpt41._build_completion_kwargs(msgs, temperature=0.2, max_tokens=2048)
+    assert gpt41_kw["max_completion_tokens"] == 2048
+    assert gpt41_kw["temperature"] == 0.2
+    assert "extra_body" not in gpt41_kw
+
+
 def test_image_graph_builders() -> None:
     g_portrait = build_portrait_graph("casual photo of an engineer", seed=99)
     assert g_portrait["1"]["inputs"]["unet_name"] == DEFAULT_HQ_MODEL

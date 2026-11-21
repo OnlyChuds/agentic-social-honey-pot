@@ -386,3 +386,97 @@ def test_strategy_pivot_blocks_escalation_drop() -> None:
     )
     errs = validate_campaign_plan(bad_pivot, snap, max_touches=7, pivot_reason="2 touches no reply")
     assert any("drops below already-seen escalation 3" in e for e in errs)
+
+
+def test_policy_anti_storm_suspicion_and_no_reply_pivots() -> None:
+    from src.orchestrator.policy import TriggerPolicy
+
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=1)
+    snap.campaign.plan = CampaignPlan(
+        objective="disclosure",
+        primary_hook="h_1",
+        touches=[TouchSpec(n=1, channel="email", intent="intro", hook="h_1", escalation=1)],
+    )
+    policy = TriggerPolicy(min_gap_s=0.0, suspicion_pivot_threshold=0.6, no_reply_pivot_threshold=2)
+
+    # High engagement + moderate vetting suspicion should not prematurely pivot
+    policy.record_signal(engagement=0.8, suspicion=0.6)
+    assert policy.strategy_pivot_reason(snap) is None
+
+    # High suspicion triggers once, then stays quiet until a new signal arrives
+    policy.record_signal(engagement=0.4, suspicion=0.85)
+    assert policy.strategy_pivot_reason(snap) is not None
+    policy.mark_strategy_pivoted()
+    assert policy.strategy_pivot_reason(snap) is None
+
+    # Consecutive no-reply fires at multiples (2, 4), not every single touch (3)
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    assert policy.strategy_pivot_reason(snap) is None
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    assert policy.strategy_pivot_reason(snap) is not None
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    assert policy.strategy_pivot_reason(snap) is None
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    assert policy.strategy_pivot_reason(snap) is not None
+
+
+def test_messaging_subject_leak_and_phantom_attachment_guards() -> None:
+    from src.agents.messaging import MessageDraft, enforce_channel_limits, lint_message_style
+
+    bad = MessageDraft(
+        channel="email",
+        subject="Re: ScaleForge Hi Julius, I was in Celonis sales ops from 2021 to 2024.",
+        body="Attached is the one-pager with the pipeline data.",
+        attachments=[],
+    )
+    lint_errs = lint_message_style(bad)
+    assert any("Subject line" in e for e in lint_errs)
+    assert any("attachments" in e for e in lint_errs)
+
+    cleaned, warns = enforce_channel_limits(bad)
+    assert cleaned.subject == "Re: ScaleForge"
+    assert warns
+
+    good = MessageDraft(
+        channel="email",
+        subject="Re: ScaleForge",
+        body="Attached is the one-pager with the pipeline data.",
+        attachments=[{"filename": "onepager.pdf", "transcript": "Summary"}],
+    )
+    assert lint_message_style(good) == []
+
+
+def test_email_html_wrapper_logo_contrast_and_html_signature_dedup() -> None:
+    from src.agents.identity import wrap_branded_email_html
+    from src.models import BrandingManifest
+
+    manifest = BrandingManifest(
+        sender_name="Elena Voss",
+        title="Head of Growth",
+        company="ScaleForge",
+        domain="scaleforge.io",
+        email="elena@scaleforge.io",
+        palette=["#111827", "#3b82f6", "#f3f4f6"],
+        logo_svg="<svg width='24' height='24'><rect width='24' height='24' fill='#111827'/></svg>",
+        signature="Elena Voss\nHead of Growth\nScaleForge GmbH",
+    )
+    html = wrap_branded_email_html(
+        manifest,
+        subject="Quick note",
+        body_html="<p>Hi Julius, quick note on scaling.</p><p>Best,<br>Elena Voss<br>Head of Growth</p>",
+    )
+    assert "background:#ffffff;border-radius:6px;padding:4px" in html
+    assert html.count("Elena Voss") == 1
+
+
+@pytest.mark.asyncio
+async def test_strategy_short_circuits_when_budget_exhausted() -> None:
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=8)
+    llm = TextLLMClient(base_url="https://llm.test/v1", api_key="k")
+    llm.complete_json = AsyncMock(side_effect=AssertionError("should not call LLM"))  # type: ignore[method-assign]
+    agent = StrategyAgent(llm)
+    prop = await agent.run(snap, mode="pivot", reason="budget done")
+    assert prop.payload["touches"] == []
+    assert prop.payload["session_restart"]["recommended"] is True
+    assert llm.complete_json.call_count == 0
+    await llm.aclose()
