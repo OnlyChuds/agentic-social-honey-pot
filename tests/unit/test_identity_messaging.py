@@ -469,7 +469,7 @@ async def test_identity_agent_bootstrap_image_wiring_and_validation(tmp_path: Pa
         )
         assert Path(str(variant["local_path"])).read_bytes() == TINY_PNG_BYTES
 
-    # Rejects blocked real root domains under strict validation
+    # Auto-repairs blocked real root domains to a lookalike, and rejects under strict validation if repair fails
     bad_manifest = manifest.model_copy(update={"domain": "stackit.cloud", "email": "a@stackit.cloud"})
     llm.complete = AsyncMock(  # type: ignore[method-assign]
         return_value=TextCompletion(
@@ -477,8 +477,16 @@ async def test_identity_agent_bootstrap_image_wiring_and_validation(tmp_path: Pa
         )
     )
     agent_no_img = IdentityAgent(llm, image_client=None, assets_dir=tmp_path)
+    repaired_prop = await agent_no_img.run(snap)
+    repaired_domain = repaired_prop.payload["manifest"]["domain"]
+    repaired_email = repaired_prop.payload["manifest"]["email"]
+    assert repaired_domain != "stackit.cloud"
+    assert check_domain_blocklist([repaired_domain, repaired_email]) == []
+
+    agent_unrepairable = IdentityAgent(llm, image_client=None, assets_dir=tmp_path)
+    agent_unrepairable._repair_blocked_domain = lambda *args, **kwargs: False  # type: ignore[method-assign]
     with pytest.raises(ValueError, match="domain validation"):
-        await agent_no_img.run(snap)
+        await agent_unrepairable.run(snap)
 
     # Graceful degradation when image_client=None on a valid manifest
     llm.complete = AsyncMock(return_value=TextCompletion(content=identity_json))  # type: ignore[method-assign]
