@@ -75,14 +75,30 @@ def _safe_hex_color(value: str, fallback: str) -> str:
 
 
 def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -> str:
-    """Remove a trailing plain-text copy of ``manifest.signature`` to avoid double signatures."""
+    """Remove trailing plain-text copies of ``manifest.signature`` / ``footer_legal``."""
     sig_lines = [line.strip() for line in manifest.signature.splitlines() if line.strip()]
-    if not sig_lines:
+    footer_lines = [line.strip() for line in manifest.footer_legal.splitlines() if line.strip()]
+    if not sig_lines and not footer_lines:
         return body
 
     body_lines = body.rstrip().splitlines()
-    # Strip trailing lines matching manifest signature lines (case-insensitive)
     idx = len(body_lines)
+
+    # First strip optional trailing footer_legal lines
+    if footer_lines:
+        f_idx = len(footer_lines) - 1
+        while idx > 0 and f_idx >= 0:
+            cur = body_lines[idx - 1].strip()
+            if not cur:
+                idx -= 1
+                continue
+            if cur.lower() == footer_lines[f_idx].lower():
+                idx -= 1
+                f_idx -= 1
+            else:
+                break
+
+    # Then strip trailing lines matching manifest.signature (case-insensitive)
     sig_idx = len(sig_lines) - 1
     matched = 0
     while idx > 0 and sig_idx >= 0:
@@ -98,6 +114,18 @@ def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -
             break
 
     if matched >= max(2, len(sig_lines) - 1) or (len(sig_lines) == 1 and matched == 1):
+        # Also strip a dangling sign-off line directly above the stripped signature
+        while idx > 0 and not body_lines[idx - 1].strip():
+            idx -= 1
+        if idx > 0 and body_lines[idx - 1].strip().lower().rstrip(",!") in {
+            "best",
+            "best regards",
+            "regards",
+            "thanks",
+            "cheers",
+            "warm regards",
+        }:
+            idx -= 1
         return "\n".join(body_lines[:idx]).rstrip()
     return body
 

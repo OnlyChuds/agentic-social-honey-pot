@@ -99,6 +99,7 @@ class Orchestrator:
         )
         self._active_conversations: dict[str, str] = {}
         self._consecutive_rejections: int = 0
+        self._consecutive_msg_failures: int = 0
         self._last_signal_payload: dict[str, Any] | None = None
 
     @property
@@ -605,16 +606,32 @@ class Orchestrator:
             latest_signal=self._last_signal_payload,
         )
         if msg_prop is None:
-            self.state.transition_state("ABORT", reason="messaging agent unavailable")
-            self.state.log_decision(
-                DecisionRecord(
-                    trigger="agent_output",
-                    snapshot_version=self.snapshot.version,
-                    actions=actions,
-                    notes="Aborting cycle: messaging agent failed to produce a proposal.",
+            self._consecutive_msg_failures += 1
+            if self.agents.messaging is None or self._consecutive_msg_failures >= 3:
+                self.state.transition_state("ABORT", reason="messaging agent unavailable")
+                self.state.log_decision(
+                    DecisionRecord(
+                        trigger="agent_output",
+                        snapshot_version=self.snapshot.version,
+                        actions=actions,
+                        notes="Aborting cycle: messaging agent failed to produce a proposal.",
+                    )
                 )
-            )
+            else:
+                self.state.log_decision(
+                    DecisionRecord(
+                        trigger="agent_output",
+                        snapshot_version=self.snapshot.version,
+                        actions=actions,
+                        notes=(
+                            f"Transient messaging failure ({self._consecutive_msg_failures}/3); "
+                            "will retry next cycle."
+                        ),
+                    )
+                )
+                await self._sleep(2.0)
             return self.snapshot
+        self._consecutive_msg_failures = 0
 
         # QA gate for visual emails
         raw_channel = str(msg_prop.payload.get("channel") or touch_spec.channel)
