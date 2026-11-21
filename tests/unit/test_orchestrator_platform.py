@@ -820,3 +820,30 @@ async def test_e2e_message_rejection_feedback_retry_and_422_pivot(tmp_path: Path
 
     await client._client.aclose()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_mock_api_sample_images_and_asset_endpoints() -> None:
+    mock_state = MockTargetState()
+    seeded = mock_state.seed_sample_images()
+    assert len(seeded) == 2
+
+    app, _ = create_mock_app(mock_state)
+    async with httpx.AsyncClient(
+        base_url="http://mock.target",
+        transport=httpx.ASGITransport(app=app),
+        headers={"Authorization": f"Bearer {mock_state.expected_token}"},
+    ) as http:
+        listing = await http.get("/v1/assets")
+        assert listing.status_code == 200
+        items = listing.json()
+        assert len(items) == 2
+        assert items[0]["asset_id"] == "a_1"
+
+        img_resp = await http.get("/v1/assets/a_1")
+        assert img_resp.status_code == 200
+        assert img_resp.headers["content-type"] == "image/png"
+        assert img_resp.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+        missing = await http.get("/v1/assets/a_999")
+        assert missing.status_code == 404

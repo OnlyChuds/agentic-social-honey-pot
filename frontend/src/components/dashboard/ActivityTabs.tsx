@@ -40,6 +40,76 @@ interface LightboxImage {
   assetId: string;
 }
 
+const HTML_TAG_RE = /<(?:html|body|div|p|table|img|svg|br|h[1-6]|a)\b/i;
+const ASSET_URI_RE = /asset:\/\/([A-Za-z0-9_.-]+)/g;
+
+function extractFallbackInlineImages(
+  body: string,
+  runId: string,
+  assetsById?: Record<string, AssetMetaJSON>
+): AssetMetaJSON[] {
+  const out: AssetMetaJSON[] = [];
+  const seen = new Set<string>();
+  for (const match of body.matchAll(ASSET_URI_RE)) {
+    const aid = match[1];
+    if (!aid || seen.has(aid)) continue;
+    seen.add(aid);
+    const meta = assetsById?.[aid];
+    out.push(
+      meta ?? {
+        asset_id: aid,
+        filename: `${aid}.png`,
+        content_type: "image/png",
+        size_bytes: 0,
+        url: `/api/targets/${encodeURIComponent(runId)}/assets/${encodeURIComponent(aid)}`,
+        is_image: true,
+        exists: true,
+      }
+    );
+  }
+  return out;
+}
+
+function extractFallbackAttachments(
+  rawAttachments: unknown,
+  runId: string,
+  assetsById?: Record<string, AssetMetaJSON>
+) {
+  if (!Array.isArray(rawAttachments)) return [];
+  return rawAttachments
+    .map((item) => {
+      if (typeof item === "string") {
+        const aid = item.replace(/^asset:\/\//, "");
+        const meta = assetsById?.[aid];
+        return {
+          kind: (meta ? (meta.is_image ? "image" : "file") : "image") as "image" | "file" | "virtual",
+          asset_id: aid,
+          url:
+            meta?.url ??
+            `/api/targets/${encodeURIComponent(runId)}/assets/${encodeURIComponent(aid)}`,
+          filename: meta?.filename ?? `${aid}.png`,
+          content_type: meta?.content_type ?? "image/png",
+          exists: meta?.exists ?? true,
+          transcript: null,
+        };
+      }
+      if (item && typeof item === "object") {
+        const obj = item as Record<string, unknown>;
+        return {
+          kind: "virtual" as const,
+          asset_id: null,
+          url: null,
+          filename: String(obj.filename ?? obj.name ?? "attachment"),
+          content_type: null,
+          exists: true,
+          transcript: typeof obj.transcript === "string" ? obj.transcript : null,
+        };
+      }
+      return null;
+    })
+    .filter((v): v is NonNullable<typeof v> => v !== null);
+}
+
 function buildSafeEmailSrcDoc(
   rawHtml: string,
   runId: string,
@@ -138,13 +208,23 @@ export function ActivityTabs({
                       ? getSuspicionBand(matchingSignal.suspicion)
                       : null;
 
-                    const isHtml = Boolean(turn.is_html);
+                    const isHtml =
+                      turn.is_html !== undefined ? Boolean(turn.is_html) : HTML_TAG_RE.test(turn.body);
                     const showSource = Boolean(sourceModeByTurn[turn.n]);
+
+                    const resolvedInlineImages =
+                      turn.inline_images !== undefined
+                        ? turn.inline_images
+                        : extractFallbackInlineImages(turn.body, runId, assetsById);
+                    const resolvedAttachments =
+                      turn.attachments !== undefined
+                        ? turn.attachments
+                        : extractFallbackAttachments(ev?.payload?.attachments, runId, assetsById);
 
                     // Collect deduplicated visual image thumbnails (inline + attached images)
                     const imageItems: LightboxImage[] = [];
                     const seenImg = new Set<string>();
-                    for (const img of turn.inline_images ?? []) {
+                    for (const img of resolvedInlineImages) {
                       if (img.exists && img.url && !seenImg.has(img.url)) {
                         seenImg.add(img.url);
                         imageItems.push({
@@ -154,7 +234,7 @@ export function ActivityTabs({
                         });
                       }
                     }
-                    const otherAttachments = (turn.attachments ?? []).filter((att) => {
+                    const otherAttachments = resolvedAttachments.filter((att) => {
                       if (att.kind === "image" && att.exists && att.url) {
                         if (!seenImg.has(att.url)) {
                           seenImg.add(att.url);
