@@ -168,7 +168,7 @@ class OSINTAgent(BaseAgent):
                 role=target.role,
                 focus=focus_question or "",
             ),
-            9000,
+            11000,
         )
 
         exact_template = {

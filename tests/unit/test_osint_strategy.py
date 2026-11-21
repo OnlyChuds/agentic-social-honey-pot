@@ -110,7 +110,64 @@ def _sample_snapshot(
 def test_osint_engine_provider_detection() -> None:
     eng = OsintEngine.from_env({"JINA_API_KEY": "k1", "TAVILY_API_KEY": "k2"})
     assert eng.available_providers() == ["jina", "tavily"]
+    assert eng.burst1_s == 12.0
+    assert eng.burst2_s == 38.0
     assert OsintAgent is OSINTAgent
+
+
+def test_render_findings_prioritizes_linkedin_and_reads_before_search() -> None:
+    from src.osint.engine import render_findings
+
+    result = OsintResult(
+        sources=[
+            Source(
+                provider="exa",
+                kind="search",
+                label="person",
+                url="https://example.com/dup/",
+                title="First Hit",
+                text="Search snippet A",
+                ok=True,
+            ),
+            Source(
+                provider="tavily",
+                kind="search",
+                label="person",
+                url="https://example.com/dup",
+                title="Duplicate Hit",
+                text="Search snippet B",
+                ok=True,
+            ),
+            Source(
+                provider="jina",
+                kind="read",
+                label="read",
+                url="https://revel8.ai/author-tom",
+                title="Tom Author Page",
+                text="Full page read body",
+                ok=True,
+            ),
+            Source(
+                provider="apify",
+                kind="linkedin_scrape",
+                label="linkedin",
+                url="https://www.linkedin.com/in/tom-c-muller",
+                title="Tom LinkedIn",
+                text="LinkedIn profile bio and posts",
+                ok=True,
+            ),
+        ],
+        org_domain="revel8.ai",
+        timings={"bursts_s": 10.0},
+        budget_usd=0.03,
+    )
+    rendered = render_findings(result, name="Tom Müller", org="revel8", role="Co-CEO", focus="")
+    li_idx = rendered.index("## [linkedin scrape]")
+    read_idx = rendered.index("## [read]")
+    search_idx = rendered.index("## person")
+    assert li_idx < read_idx < search_idx
+    assert "First Hit" in rendered
+    assert "Duplicate Hit" not in rendered
 
 
 def test_find_linkedin_url_unwraps_authwall_and_regional_subdomains() -> None:
