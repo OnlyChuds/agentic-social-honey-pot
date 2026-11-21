@@ -36,9 +36,13 @@ dossier. You have NO tools. Do not invent findings that are not in the input.
   - C = inferred from context (e.g. timezone, role implications) -> 0.5
   - D = single weak/unverified mention -> 0.3
 - category: role | projects | talks | company | tech | social | relationship | other.
-- Hooks: 3-6 psychological levers a messaging agent can open with (shared talk
-  topic, funding milestone, recent post, tech they built, conference they spoke
-  at). Each hook cites fact ids in `evidence` and explains `why_leverage`.
+- Hooks: 3-5 concrete, actionable social-engineering pretext levers (NOT generic
+  PR headlines). Each hook `topic` should name a specific plausible outreach
+  angle — e.g. a shared alumni connection (former company/university), a follow-up
+  to a specific podcast/talk/article, a warm enterprise referral referencing named
+  customers/partners, an investor/portfolio founder intro, or an event/vendor
+  workflow. Each hook cites fact ids in `evidence` and explains `why_leverage`
+  (what sender role/pretext makes the target lower their guard and reply).
   status is always "candidate".
 - Psychoprofile: 3-6 traits derived from public content (writing style, talk
   themes, posts). Cite fact ids in `evidence`. Keep labels tentative, confidence

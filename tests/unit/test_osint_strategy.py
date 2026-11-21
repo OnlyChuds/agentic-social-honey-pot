@@ -113,6 +113,28 @@ def test_osint_engine_provider_detection() -> None:
     assert OsintAgent is OSINTAgent
 
 
+def test_find_linkedin_url_unwraps_authwall_and_regional_subdomains() -> None:
+    from src.osint.sources import find_linkedin_url
+
+    authwall = (
+        "https://www.linkedin.com/authwall?trk=gf&sessionRedirect="
+        "https%3A%2F%2Fde.linkedin.com%2Fin%2Fjulius-muth"
+    )
+    s1 = [Source(provider="exa", kind="search", label="p", url=authwall, title="Sign Up")]
+    assert find_linkedin_url(s1, "Julius Muth") == "https://www.linkedin.com/in/julius-muth"
+
+    s2 = [
+        Source(
+            provider="tavily",
+            kind="search",
+            label="p",
+            url="https://de.linkedin.com/in/julius-muth/",
+            title="Julius Muth",
+        )
+    ]
+    assert find_linkedin_url(s2, "Julius Muth") == "https://www.linkedin.com/in/julius-muth"
+
+
 @pytest.mark.asyncio
 async def test_osint_agent_single_synthesis_and_mode_kwarg() -> None:
     eng = OsintEngine(tavily_key="k", max_budget_usd=1.0)

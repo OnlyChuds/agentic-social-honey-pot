@@ -168,7 +168,7 @@ class OSINTAgent(BaseAgent):
                 role=target.role,
                 focus=focus_question or "",
             ),
-            10000,
+            9000,
         )
 
         exact_template = {
@@ -187,9 +187,9 @@ class OSINTAgent(BaseAgent):
             "hook_seeds": [
                 {
                     "hook_id": "h_01",
-                    "topic": "Specific actionable social-engineering leverage angle",
+                    "topic": "Concrete pretext angle (e.g. 'Former Celonis Munich alumni warm intro for DACH enterprise pilot')",
                     "evidence": ["f_01"],
-                    "why_leverage": "Why target will engage with this topic",
+                    "why_leverage": "Why this specific sender role & angle lowers the target's guard",
                     "confidence": 0.8,
                     "status": "candidate",
                 }
@@ -220,11 +220,12 @@ class OSINTAgent(BaseAgent):
                         "focus_question": focus_question,
                         "research_findings": findings,
                         "instructions": (
-                            "Return ONLY compact JSON using the EXACT keys shown in exact_template "
-                            "(use fact_id, claim, osint_grade — NOT id/statement/grade). "
-                            "Emit 8-10 concise 1-sentence facts, 3-5 concrete hook_seeds anchored "
-                            "to those fact_ids, 3-4 psychoprofile traits anchored to fact_ids, "
-                            "org_branding, and at most 3 open_questions."
+                            "Return ONLY compact minified JSON (no indentation or extra blank lines) "
+                            "using the EXACT keys shown in exact_template (use fact_id, claim, "
+                            "osint_grade — NOT id/statement/grade). Emit 8 concise 1-sentence "
+                            "facts (prioritize LinkedIn scrape & primary sources), 3-4 concrete "
+                            "pretext hook_seeds anchored to those fact_ids, 3 psychoprofile traits "
+                            "anchored to fact_ids, org_branding, and at most 2 open_questions."
                         ),
                         "exact_template": exact_template,
                     },
@@ -239,7 +240,7 @@ class OSINTAgent(BaseAgent):
                     synthesis_messages,
                     DossierPayload,
                     temperature=0.2,
-                    max_tokens=min(self.prompt.max_tokens, 2048),
+                    max_tokens=min(self.prompt.max_tokens, 2560),
                     retries=1,
                 ),
                 timeout=_SYNTH_TIMEOUT_S,
@@ -251,7 +252,7 @@ class OSINTAgent(BaseAgent):
                         synthesis_messages,
                         DossierPayload,
                         temperature=0.2,
-                        max_tokens=min(self.prompt.max_tokens, 1536),
+                        max_tokens=min(self.prompt.max_tokens, 2048),
                         retries=0,
                     ),
                     timeout=_FALLBACK_TIMEOUT_S,
