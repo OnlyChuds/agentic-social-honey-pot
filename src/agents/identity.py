@@ -167,7 +167,11 @@ def wrap_branded_email_html(
         html_lib.escape(line) for line in manifest.signature.splitlines() if line.strip()
     )
 
-    logo_block = manifest.logo_svg.strip() if manifest.logo_svg.strip().startswith("<svg") else ""
+    logo_block = (
+        manifest.logo_svg.strip()
+        if manifest.logo_svg.strip().startswith(("<svg", "<img"))
+        else ""
+    )
     portrait_html = ""
     if portrait_ref:
         safe_ref = html_lib.escape(portrait_ref, quote=True)
@@ -320,6 +324,7 @@ class IdentityAgent(BaseAgent):
 
         for spec in output.image_prompts:
             filename = f"{base_slug}_{_slugify(spec.asset, 'portrait')}.png"
+            asset_l = spec.asset.strip().lower()
             try:
                 if spec.reference_asset and spec.reference_asset in generated_paths:
                     res = await handlers["edit_image"](
@@ -327,6 +332,17 @@ class IdentityAgent(BaseAgent):
                             "reference_path": generated_paths[spec.reference_asset],
                             "instruction": spec.prompt,
                             "filename": filename,
+                            "seed": spec.seed,
+                        }
+                    )
+                elif any(tok in asset_l for tok in ("logo", "badge", "icon", "emblem")):
+                    dim = max(256, min(1024, int(spec.size or 512)))
+                    res = await handlers["generate_fast_image"](
+                        {
+                            "prompt": spec.prompt,
+                            "filename": filename,
+                            "width": dim,
+                            "height": dim,
                             "seed": spec.seed,
                         }
                     )
@@ -342,7 +358,10 @@ class IdentityAgent(BaseAgent):
                 if isinstance(res, dict) and res.get("local_path"):
                     local_path = str(res["local_path"])
                     generated_paths[spec.asset] = local_path
-                    if spec.asset == "master_portrait" or not output.manifest.portrait.local:
+                    if spec.asset == "master_portrait" or (
+                        not output.manifest.portrait.local
+                        and not any(tok in asset_l for tok in ("logo", "badge", "icon", "emblem"))
+                    ):
                         output.manifest.portrait.local = local_path
             except Exception as exc:  # noqa: BLE001
                 msg = f"Image generation failed for '{spec.asset}': {type(exc).__name__}: {exc}"
@@ -350,6 +369,63 @@ class IdentityAgent(BaseAgent):
                 warnings.append(msg)
 
         return generated_paths, warnings
+
+    @staticmethod
+    def _fallback_bootstrap_identity(
+        snapshot: Snapshot,
+        sender_concept: str | None = None,
+    ) -> IdentityOutput:
+        """Deterministic fallback persona so bootstrap never leaves snapshot.identity=None."""
+        target_org = snapshot.target.org or "TargetOrg"
+        concept = sender_concept or "DACH enterprise engineering & GTM partner"
+        company = "NordPeak Advisory"
+        domain = "nordpeak-advisory.de"
+        sender_name = "Lukas Weber"
+        title = "Partner, Enterprise Architecture"
+        email = f"lukas.weber@{domain}"
+        manifest = BrandingManifest(
+            concept=concept,
+            sender_name=sender_name,
+            title=title,
+            company=company,
+            real_org=target_org,
+            domain=domain,
+            email=email,
+            phone="+49 89 5550 2418",
+            bio=(
+                "I advise DACH B2B software founders on enterprise architecture and technical "
+                "partnerships. Previously worked across Munich scale-ups on high-throughput data systems."
+            ),
+            logo_svg="",
+            palette=["#111827", "#2563eb", "#f3f4f6"],
+            fonts=["Inter", "system-ui", "sans-serif"],
+            signature=f"{sender_name}\n{title}\n{company} GmbH",
+            footer_legal=f"{company} GmbH · Munich",
+        )
+        return IdentityOutput(
+            manifest=manifest,
+            image_prompts=[
+                ImagePromptSpec(
+                    asset="master_portrait",
+                    prompt=(
+                        "casual smartphone headshot of Lukas Weber, a 36-year-old German male "
+                        "technology advisor in a dark navy overshirt over a plain t-shirt, "
+                        "natural daylight in a modern Munich office, relaxed expression, unretouched"
+                    ),
+                    seed=42,
+                    size=1024,
+                ),
+                ImagePromptSpec(
+                    asset="logo",
+                    prompt=(
+                        "minimalist flat geometric mountain-peak tech company logo mark for "
+                        "NordPeak Advisory, navy and blue shapes on pure white background, centered, no text"
+                    ),
+                    seed=42,
+                    size=512,
+                ),
+            ],
+        )
 
     async def generate_portrait_variant(
         self,
@@ -461,8 +537,36 @@ class IdentityAgent(BaseAgent):
                     manifest=snapshot.identity.model_copy(deep=True),
                     page_html=render_landing_page(landing_page_spec, snapshot.identity),
                 )
+            elif mode == "bootstrap":
+                logger.warning(
+                    "Identity bootstrap LLM call failed (%s: %s); using deterministic fallback persona.",
+                    type(exc).__name__,
+                    exc,
+                )
+                output = self._fallback_bootstrap_identity(snapshot, sender_concept=sender_concept)
             else:
                 raise
+
+        if (
+            mode == "bootstrap"
+            and self.image_client is not None
+            and not any(
+                any(tok in spec.asset.lower() for tok in ("logo", "badge", "icon", "emblem"))
+                for spec in output.image_prompts
+            )
+        ):
+            company_label = output.manifest.company or output.manifest.sender_name or "Company"
+            output.image_prompts.append(
+                ImagePromptSpec(
+                    asset="logo",
+                    prompt=(
+                        f"minimalist flat geometric tech company logo icon for {company_label}, "
+                        "crisp vector emblem on pure white background, centered, no text"
+                    ),
+                    seed=42,
+                    size=512,
+                )
+            )
 
         if (
             mode in {"landing_page", "revise"}

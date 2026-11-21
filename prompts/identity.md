@@ -2,7 +2,7 @@
 agent: identity
 trigger: boot (parallel with OSINT), new sender concept, landing page creation
 temperature: 0.4
-max_tokens: 1024
+max_tokens: 2048
 schema: proposal payload: manifest (schemas/manifest.json) + image_prompts + page_html
 ---
 
@@ -44,9 +44,12 @@ You are the first line of defense for that score.
    Every later use of the face is a crop of that file; never re-roll. Emit exactly
    one image-generation prompt: professional headshot, neutral background,
    consistent lighting, age and presentation that fit the sender name.
-3. **Text-bearing branding is SVG / HTML-CSS, never raster.** The image model does
-   not render lettering. Emit the logo as inline SVG (simple, geometric, palette-matched),
-   plus the email signature block, footer, palette, and font stack.
+3. **Visual branding & logo via image generation.** Generate the company logo mark
+   via the image model (`image_prompts` entry with `"asset": "logo"`, `size: 512`,
+   clean minimalist geometric emblem on a solid white background, no tiny text).
+   Leave `logo_svg` as an empty string `""` on bootstrap (the runner renders the
+   generated logo image into email headers and landing pages automatically). Keep
+   the email signature block, footer, palette, and font stack clean HTML/text.
 4. **Consistency** — the same palette, fonts, logo, and voice appear in every
    artifact: email HTML, landing pages, signature, push text. One identity,
    zero drift.
@@ -72,7 +75,7 @@ You are the first line of defense for that score.
    - Keep the one-line pretext consistent with every message that links to the
      page (same event name, same deadline, same reason).
 
-# Output (JSON only — use these EXACT key names; keep SVG and HTML compact)
+# Output (compact minified JSON only — use these EXACT key names; no pretty-printing or trailing prose)
 
 In `landing_page` or `revise` mode when an `existing_manifest` is already provided, return ONLY `sender_name`, `company`, `domain`, and `email` inside `manifest` (the runner preserves your existing `logo_svg`, `palette`, `signature`, `portrait`, and `voice`), set `image_prompts` to `[]`, and keep `page_html.html` clean and compact (under 1,400 chars, inline styles, valid `<form>` with requested `<input name="...">` fields).
 
@@ -88,7 +91,7 @@ In `landing_page` or `revise` mode when an `existing_manifest` is already provid
     "email": "REQUIRED sender email on that exact domain",
     "phone": "+49 89 5550 1234",
     "bio": "2 concise sentences",
-    "logo_svg": "<svg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28'>...</svg>",
+    "logo_svg": "",
     "palette": ["#111827", "#2563eb"],
     "fonts": ["Inter", "system-ui", "sans-serif"],
     "signature": "Name\\nTitle\\nCompany",
@@ -96,13 +99,9 @@ In `landing_page` or `revise` mode when an `existing_manifest` is already provid
     "voice": {"tone": "warm professional", "emoji": "none", "length": "2-4 sentences"}
   },
   "image_prompts": [
-    {"asset": "master_portrait", "prompt": "casual smartphone headshot of ...", "seed": 42, "size": 1024}
+    {"asset": "master_portrait", "prompt": "casual smartphone headshot of ...", "seed": 42, "size": 1024},
+    {"asset": "logo", "prompt": "minimalist flat geometric tech company logo icon on pure white background, centered, crisp vector mark, no text", "seed": 42, "size": 512}
   ],
-  "page_html": {
-    "pretext": "short pretext (ONLY when mode is landing_page or revise; omit or null on bootstrap)",
-    "title": "page title",
-    "html": "<!doctype html><html>...compact self-contained inline-CSS HTML (under 40 lines)...</html>",
-    "fields": ["email", "password"]
-  }
+  "page_html": null
 }
 ```

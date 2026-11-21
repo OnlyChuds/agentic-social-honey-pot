@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from src.agents.base import BaseAgent
 from src.agents.identity import wrap_branded_email_html
-from src.agents.qa import check_disallowed_meta_text
+from src.agents.qa import check_disallowed_meta_text, check_placeholders
 from src.llm.text import TextLLMClient
 from src.models import (
     BrandingManifest,
@@ -376,6 +376,9 @@ def lint_message_style(draft: MessageDraft) -> list[str]:
             "either include a concrete attachment or remove the 'attached' wording."
         )
 
+    for placeholder_issue in check_placeholders(combined):
+        issues.append(placeholder_issue.fix)
+
     for meta_issue in check_disallowed_meta_text(combined):
         issues.append(meta_issue.fix)
 
@@ -463,6 +466,13 @@ class MessagingAgent(BaseAgent):
             lint_issues = lint_message_style(draft)
 
         draft, limit_warnings = enforce_channel_limits(draft)
+        if snapshot.identity is not None and snapshot.identity.sender_name:
+            draft.body = re.sub(
+                r"\[(?:your|my|sender)[\s_-]?name\]",
+                snapshot.identity.sender_name,
+                draft.body,
+                flags=re.IGNORECASE,
+            )
         valid_facts, fact_warnings = validate_facts_used(
             draft.facts_used,
             snapshot,
