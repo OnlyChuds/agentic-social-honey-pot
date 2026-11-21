@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.base import BaseAgent
+from src.agents.landing_pages import PageArtifactSpec
 from src.agents.qa import check_domain_blocklist
 from src.llm.image import IMAGE_TOOL_SCHEMAS, ImageClient, make_image_tool_handlers
 from src.llm.text import TextLLMClient
@@ -36,13 +37,6 @@ class ImagePromptSpec(BaseModel):
     seed: int = 42
     size: int = 1024
     reference_asset: str | None = None
-
-
-class PageArtifactSpec(BaseModel):
-    pretext: str = ""
-    title: str = ""
-    html: str = ""
-    fields: list[str] = Field(default_factory=list)
 
 
 class IdentityOutput(BaseModel):
