@@ -1,5 +1,7 @@
 # Team Roles & Parallel Work Split (3-Person Setup)
 
+> **Status:** Historical build-phase split — all 3 roles plus the dashboard, Target API leverage workstreams, and Eval launcher are now **merged and unified on `main`**. See [README.md](../README.md) and [docs/architecture.md](architecture.md) for the current system overview and runbook.
+
 The shared core contracts are already merged on `main`:
 - `src/config.py` — typed YAML + `.env` loader (`load_config()`)
 - `src/models.py` — Pydantic v2 models for all §8 shared-memory schemas (`Snapshot`, `Proposal`, `Fact`, `Hook`, `Profile`, `BrandingManifest`, `CampaignPlan`, `QAVerdict`, `Event`, `DecisionRecord`)

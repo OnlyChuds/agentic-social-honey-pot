@@ -84,7 +84,7 @@ An incident win occurs when an attack achieves any of the following goals:
 | Phase | Scenario | Sessions | Contacts / Touch Budget | Timing | Scoring |
 |---|---|---|---|---|---|
 | **Practice** | `practice` | Unlimited | 30 touches / session | Kickoff (Saturday) onwards | ❌ Unscored |
-| **Evaluation** | `eval` | 3 per team | 10 touches / session | Sunday morning (exact window announced at event) | ✅ Scored (Median of runs) |
+| **Evaluation** | `eval` | 5 per persona (15 total; originally 3) | 10 touches / session | Sunday morning (exact window announced at event) | ✅ Scored (Best 2 of 5 runs per persona) |
 
 ---
 

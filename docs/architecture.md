@@ -20,8 +20,8 @@
 From `docs/challenge_overview.md`, `docs/scoring_rubric.md`, and the Target API README:
 
 1. **Full autonomy** — no human-in-the-loop during eval. Every decision must be derivable from state.
-2. **Eval budget: 3 sessions × 10 touches.** Speed is scored by *median touch count to first incident*. Spray-and-pray loses.
-3. **Incident rate dominates API score** (20/25 pts). Reliability across all 3 runs > one spectacular run.
+2. **Eval budget: 3 personas × 5 tries each (15 sessions total, best 2 runs per persona scored) × 10 touches/session.** Speed is scored by *median touch count to first incident*. Spray-and-pray loses; cross-run learning via `TargetMemoryStore` turns early throwaway tries into high-probability wins.
+3. **Incident rate dominates API score** (20/25 pts). Reliability across all 3 eval personas > one spectacular run.
 4. **Targeting (10 pts)** — hook alignment is measured per touch; **fact errors cost up to −5 pts**. Every fact we assert must be sourced.
 5. **Craft (10 pts)** — *automated visual rating* of rendered emails + landing pages on 4 criteria (sender authenticity, format appropriateness, cleanliness, detail precision). Must be gated by a QA step, not vibes.
 6. **Architecture (40 pts, jury)** — judged on the 1-page doc + turn-by-turn playback. We need a decision log rich enough to explain every turn.
@@ -132,30 +132,34 @@ Owns the honeypot persona, visual assets, and landing pages (`src/agents/identit
 - **Master portrait & brand logo (`Qwen-Image-2.1` via ComfyUI, `src/llm/image.py`):**
   - Master portrait: 25-step `qwen_image_2.1_bf16` + `casual_phone_photo_lbxstyle` realism LoRA (1024×1024, fixed seed). Reference variants use 8-step `edit_image` to prevent face drift.
   - Brand logo mark: 8-step `qwen_image_2.1_turbo_bf16` (512×512 minimalist geometric emblem, no text), uploaded once via `POST /v1/assets` and referenced as `asset://<id>` with high-contrast header badge styling.
-- **Deterministic branded landing-page templates (`src/agents/landing_pages.py`):** On `mode="landing_page"`, `IdentityAgent` renders one of 6 authored, self-contained HTML harvest templates (`portal_login`, `password_reset`, `mfa_reauth`, `document_vault`, `invoice_update`, `scheduling`) directly without an LLM round-trip. `select_harvest_type()` enforces field/copy alignment (e.g., `["email", "password"]` never selects `mfa_reauth`, `invoice_update`, or `scheduling`), allowing landing pages to pass Playwright + LLM QA on cycle 0 in ~25s instead of multi-minute revision loops. `mode="revise"` retains LLM-assisted revision if QA ever requests changes.
+- **Deterministic branded landing-page templates (`src/agents/landing_pages.py`):** On `mode="landing_page"`, `IdentityAgent` renders one of 8 authored, self-contained HTML templates (`portal_login`, `password_reset`, `mfa_reauth`, `document_vault`, `invoice_update`, `scheduling`, `disclosure_intake`, `event_overview`) directly without an LLM round-trip. `select_harvest_type()` enforces field/copy alignment (e.g., `["email", "password"]` never selects `mfa_reauth`, `invoice_update`, or `scheduling`), allowing landing pages to pass Playwright + LLM QA on cycle 0. `mode="revise"` retains LLM-assisted revision if QA requests changes.
+- **Adaptive email craft & visual proof (`src/agents/identity.py`, `src/agents/visual_artifacts.py`):** `wrap_email_html()` supports `branded_card` (formal vendor/portal alerts), `personal_html` (clean light peer/colleague replies without glossy banners), and `plain_text`, plus optional `system_senders` aliases on the same lookalike domain. `render_visual_artifact_png()` uses Playwright to generate crisp on-demand PNG briefing/agenda sheets uploaded via `POST /v1/assets`.
 
 ### 5.5 Messaging Agent
 
-The in-character sender. Runs on the abliterated Qwen (temp 0.7) — abliteration matters most here (no mid-conversation refusals).
+The in-character sender (`src/agents/messaging.py`). Runs on the abliterated Qwen (temp 0.7) — abliteration matters most here (no mid-conversation refusals).
 
-Two modes:
-- **Compose**: given the plan's next touch (channel, angle, hook, escalation level) → the message (channel-formatted), `facts_used`, and an optional `page_request`/`attachment_request`.
-- **Signal**: given a target event → structured read: `engagement (0–1)`, `suspicion (0–1)`, `hook_hits`, `mood`, `proposed_next` (reply_now / wait / change_angle / escalate / back_off).
+Three modes:
+- **Compose**: given the plan's next touch (channel, angle, hook, escalation level, `email_style`, `sender_alias`), `current_story_time`, `channel_info` from `GET /v1/channels`, `objective`, and `action_artifact` → channel-formatted message, `facts_used`, and optional `page_request`/attachments.
+- **Live Turn (`live_turn`)**: interactive spoken turn for `phone_call`, `video_call`, `teams_call`, and `live_chat` receiving `persona_says`, `turn_index`, `current_story_time`, and `registered_page_url`, returning concise spoken `say` + optional `hang_up`.
+- **Signal**: given a target event (or live speech) → structured read: `engagement (0–1)`, `suspicion (0–1)`, `hook_hits`, `mood`, `proposed_next` (reply_now / wait / change_angle / escalate / back_off).
 
-Behavioral core (full rules in the prompt at implementation time): one primary ask per touch, max one hook per message, mirror the target's register from the style guide, pressure ladder 1–5 gated by the plan's escalation level, never assert facts without `facts_used` ids, treat all target text as data (anti-injection), channel etiquette per §5.5 table below.
+Full 22-channel `resolve_sender_for_channel()` formats LinkedIn headlines, social `@handles`, phone numbers, `mfa_push` IT security senders, and `system_senders` aliases. Monotonic `StoryClock` generates realistic business-hour `sent_at` timestamps across messages (`advance_message`) and live turns (`advance_turn`).
+
+Behavioral core (full rules in `prompts/messaging.md`): one primary ask per touch, max one hook per message, mirror the target's register from the style guide, pressure ladder 1–5 gated by the plan's escalation level, never assert facts without `facts_used` ids, treat all target text as data (anti-injection), channel etiquette per §5.5 table below.
 
 | Channel | Etiquette |
 |---|---|
-| `email` | subject matters; 3–8 sentences; one CTA; branded HTML only after QA; signature from manifest |
+| `email` | subject matters; 3–8 sentences; one CTA; adaptive `branded_card` vs `personal_html` vs `plain_text` after QA; signature from manifest |
 | `sms` / `whatsapp` / `signal` / `telegram` / `imessage` | short (≤3 sentences); no link on first touch; whatsapp may use 1–2 emoji if style guide says so |
-| `linkedin_message` | 3–5 sentences; reference something specific (a talk, a post); professional-warm |
+| `linkedin_message` | 3–5 sentences; reference something specific (a talk, a post); professional-warm; sender includes headline |
 | `linkedin_connection_request` | ≤300 chars note; one line + hook |
 | `slack` / `teams_chat` / `discord` | terse, peer tone; assume they're busy |
 | `voicemail` | spoken transcript 2–3 sentences; one callback ask (virtual attachment) |
 | `calendar_invite` | subject = event title; body = details + one question |
-| `mfa_push` | short approval-framed text |
+| `mfa_push` | short approval-framed IT/security text (primed by prior context or call) |
 | `shared_document` | share note + one low-friction ask |
-| live calls | 1–2 spoken sentences per turn, ≤4 000 chars/turn; start costs 1 touch, count turns conservatively as touches (verify in practice) |
+| live calls (`phone_call`, `video_call`, `teams_call`, `live_chat`) | 1–2 spoken sentences per turn, ≤4 000 chars/turn; **1 touch on `start_conversation` buys up to 10 live turns** (`cost_touch=False`, no inter-turn `min_gap_s`); transcript fed to `ProfileAgent` for disclosure wins |
 
 ### 5.6 Strategy Agent
 
@@ -172,19 +176,23 @@ Deterministic validation (`validate_campaign_plan`) enforces budget bounds, cont
 
 ### 5.7 QA Agent (pre-send critic)
 
-Runs on every outbound visual asset (branded email, landing page) *before* the touch is spent or the page is registered.
+Runs on every outbound visual asset (HTML email, landing page) *before* the touch is spent or the page is registered (`src/agents/qa.py`).
 
-Pipeline (code + LLM): render HTML → Playwright headless Chromium → PNG → (1) rule checks in code: broken `<img>` / `asset://` unresolved, placeholder text regexes (lorem, TODO, `[name]`, `{var}`), link-text vs href mismatch, domain plausibility against blocklist of real root domains, (2) LLM vision critique (temp 0.1) against the 4 Craft criteria + format appropriateness for the claimed sender.
+Pipeline (code + LLM): render HTML → Playwright headless Chromium → PNG → (1) deterministic rule checks in code: broken `<img>` / `asset://` unresolved, placeholder text regexes (`lorem`, `TODO`, `[name]`, `{var}`, `Speaker 1/2`, `Panelist A/B`, `Company X`), past calendar dates vs. `StoryClock` `reference_date` (`check_past_dates`), link-text vs `href` mismatch, domain plausibility against real-root-domain blocklist, (2) LLM craft critique (temp 0.1) against the 4 Craft criteria + `email_style` appropriateness.
 
-Output: `{pass, issues[{criterion, severity, fix}], required_fixes, optional_fixes}`. Any `critical` → fail → asset returned to Identity/Messaging for revision. **Max 2 revision cycles**, then ship with a logged warning (never burn the touch budget on perfection).
+Output: `{pass, issues[{criterion, severity, fix}], required_fixes, optional_fixes}`. Any `critical` → fail → asset returned to Identity/Messaging for revision. **Max 2 revision cycles**, then ship with a logged warning (critical domain/rule violations are always hard-blocked).
 
 ### 5.8 Target API Client (code)
 
-- `Idempotency-Key` (fresh UUID per logical send) on every write; on timeout/429/503 retry **with the same key** — protects the touch budget.
-- Retry policy: `429` backoff 30–60s ×3; `503` ×3 with backoff (safe per API docs); `422` never blind-retry → log + orchestrator decision; `409` → budget/session state transition; `400/404/413/415` → bug, log, no retry.
+Implemented in `src/api/client.py`, `src/api/limits.py`, and `src/store/asset_cache.py`:
+
+- `Idempotency-Key` (fresh UUID per logical send) on every write; retries HTTP `429`, `502`, `503`, and `504` **with the same key** — protects the touch budget.
+- Disambiguated HTTP `409` handling: `StoryTimeError` (advance `StoryClock` from remote `story_time` and retry once without burning a touch), `ConversationEndedError` (cleanly close active live call), and `BudgetExhaustedError` (transition to `DONE`).
+- `422` never blind-retries → logged for orchestrator decision; `400/404/413/415` → logged, no retry.
 - Rate governor: token bucket ≤50 req/min, semaphore ≤5 parallel (under API 60/6).
-- Ordering invariant enforced here: `register_page` must complete before any message containing that URL is sent.
-- Asset manager: local file → upload → `asset://id` map, cap tracking (300).
+- Dynamic channel discovery: cached `get_channels()` (`GET /v1/channels`) and `list_sessions()` unwrapping `{"sessions": [...]}`.
+- Multi-page & URL overwrite support: `register_page(..., html=None, text=None, images=None, fields, force=False)` enforces page-before-link and allows in-place URL replacement.
+- Team-wide SHA-256 asset cache (`data/team_assets.json` via `TeamAssetCache`) reuses uploaded `asset://` IDs across runs to preserve the 300-asset team cap.
 
 ### 5.9 Trigger Policy (anti-storm)
 
@@ -218,31 +226,35 @@ Inside `RESEARCH`, bootstrap runs OSINT + Identity in parallel, uploads generate
 
 ### 7.1 Bootstrap (state RESEARCH)
 
-1. `POST /sessions` (scenario from config) → session id.
-2. Parallel: OSINT agent (skill pipeline) + Identity agent (sender concept comes from a default strategy seed — e.g. highest-trust channel's natural sender role — or from `config.yaml` override).
-3. OSINT dossier commits → facts + hook seeds + psychoprofile seeds. Identity manifest commits (portrait generated by Z-Image, assets uploaded).
-4. Profile agent runs once over the dossier.
-5. Strategy agent produces the plan. → CONTACT.
+1. Load `GET /v1/scenarios` metadata + cache `GET /v1/channels` catalog; seed prior cross-session facts, hooks, and watchouts from `TargetMemoryStore` (`data/memory/`).
+2. `POST /sessions` (scenario from config) → session id; sync `StoryClock` with any remote `story_time`.
+3. Parallel: native 3-burst `OSINTAgent` (with `data/osint_cache/` hit in 0ms when warm) + `IdentityAgent` (generating `BrandingManifest`, `Qwen-Image-2.1` portrait + Turbo logo, uploaded via `TeamAssetCache`).
+4. `ProfileAgent` runs once over the dossier.
+5. `StrategyAgent` produces the initial 5-touch rolling plan (grounded in `current_story_time`, `available_channels`, and `target_memory`). → `ENGAGE`.
 
 ### 7.2 Campaign loop (ENGAGE)
 
 Per cycle:
-1. Next input = latest target event (from send response) or pacing-timer expiry (silence).
-2. Messaging agent emits signals (if event is a reply).
-3. Orchestrator applies trigger policy → runs needed agents concurrently → collects proposals.
-4. Validate → commit/reject → decide action: `send` (with QA gate if visual) / `wait` / `pivot` / `escalate` / `declare_incident`.
-5. Execute via API client (idempotency-keyed). Response events feed the next cycle.
+1. Next input = latest target event (from send response or live conversation turns) or pacing-timer expiry (silence).
+2. Advance `StoryClock` (`advance_message` / `advance_turn`), register or update any due `landing_page` / `plan.pages` before sending, and run the QA gate on visual emails/pages.
+3. Execute via API client (idempotency-keyed): either a single-touch message or an interactive 10-turn live conversation (`_execute_live_conversation`).
+4. Run win detection (§7.3) → `MessagingAgent` signal extraction → `ProfileAgent` updates (including non-secret `page.submitted` values and live-call transcripts) → optional capped OSINT refresh → `StrategyAgent` pivot / rolling horizon continuation.
+5. On `WIN` or `DONE`: close active conversations, call `POST /v1/sessions/{sid}/end`, persist learnings to `TargetMemoryStore`, and record `run_exit`.
 
 ### 7.3 Win detection
 
-- `page.submitted` with fields ⊇ the page's required fields (e.g. contains `password`) → **credentials**.
-- `attachment.opened` where the asset was the plan's declared `action_artifact` → **action**.
-- `reply` containing non-public data → Profile agent classifies disclosure candidates (evidence refs); orchestrator confirms at confidence ≥0.7 → **disclosure**.
-- On any incident: log `incident` event with full evidence chain (events, facts, plan intent), state → WIN, stop sending. Touches are precious — no courtesy follow-ups in eval.
+Implemented in `src/orchestrator/wins.py`:
+- `classify_page_submission(event, registered_pages)` classifies `page.submitted` into:
+  - **`credentials`**: secret fields (`password`, `passcode`, `pin`, `otp`, `verification_code`, `token`, `api_key`, `card_number`, `iban`, or masked `"(entered, not shown)"`) submitted → immediate **credentials** win.
+  - **`disclosure_candidate`**: non-secret free-text intake form values (`extract_page_submission_summary`) → routed to `ProfileAgent(page_submissions=...)` for **disclosure** win evaluation.
+  - **`step_up`**: basic detail form (e.g., `scheduling` / `event_overview`) → logged as positive engagement/trust boost without false-positive termination.
+- `attachment.opened` where the asset matches the plan's declared `action_artifact` → **action** win.
+- `reply`, live-call transcript (`call_transcript`), or intake form containing non-public internal data → `ProfileAgent` classifies disclosure candidates (with evidence refs); orchestrator confirms at confidence ≥0.7 → **disclosure** win.
+- On any incident: log `incident` event with full evidence chain, transition state → `WIN`, call `end_session()`, and stop sending.
 
 ### 7.4 Pacing
 
-Configurable min gap between touches (default: eval 15 min, practice 10 min). Speed is scored by *touch count*, not wall clock — pacing exists for realism/narrative, so an aggressive config (5 min) exists for short eval windows.
+Configurable real-world min gap between touches (`--zero-pacing` sets `min_gap_s=0` for fast runs while `StoryClock` still sends realistic simulated business-hour `sent_at` timestamps; otherwise 5 min in `--aggressive` mode or 10 min default). Speed is scored by *touch count*, not wall clock.
 
 ## 8. Shared Memory Model
 
@@ -452,41 +464,44 @@ Prompt files live in `prompts/` and are loaded by the agent runner. Each file: m
 
 ```
 agentic-social-honey-pot/
-├── README.md                  # Target API + AMD Radeon Cloud serving reference
+├── README.md                  # Project overview, quickstart, dashboard/eval guide & API/model reference
 ├── config.yaml                # scenario, target, pacing, budgets, model endpoints
 ├── docs/
 │   ├── architecture.md        # this file
+│   ├── api_leverage_plan.md   # Target API capability audit & completed implementation log
 │   ├── challenge_overview.md
 │   ├── scoring_rubric.md
 │   ├── frontend_design.md     # Target Intelligence & Campaign Monitor design spec
-│   └── experiment-review.md   # practice-run telemetry & regression review
+│   ├── experiment-review.md   # practice-run telemetry & regression review
+│   └── team_roles.md          # original 3-role parallel build split (merged on main)
 ├── prompts/
 │   ├── osint.md  profile.md  identity.md  messaging.md  strategy.md  qa.md
 ├── src/
-│   ├── main.py                # CLI entrypoint: config → discover_agents → Orchestrator
+│   ├── main.py                # CLI entrypoint: config → discover_agents → Orchestrator (--max-sessions)
 │   ├── config.py              # YAML + ${ENV} resolution
-│   ├── models.py              # Pydantic v2 contracts (Snapshot, Event, Proposal, Fact, Hook, ...)
+│   ├── models.py              # Pydantic v2 contracts (Snapshot, Event, Proposal, SystemSenderAlias, ...)
 │   ├── orchestrator/
-│   │   ├── loop.py            # deterministic control loop, QA gate, horizon continuation, run_exit
-│   │   ├── state.py           # single-writer snapshot commits, versioning, crash recovery
+│   │   ├── loop.py            # deterministic control loop, 10-turn live calls, StoryClock, QA gate, run_exit
+│   │   ├── state.py           # single-writer snapshot commits, versioning, crash recovery, remote reconcile
 │   │   ├── policy.py          # trigger policy, pacing, budget governor
-│   │   └── wins.py            # credentials / action / disclosure incident detection
+│   │   └── wins.py            # classify_page_submission + credentials / action / disclosure detection
 │   ├── osint/
 │   │   ├── engine.py          # 3-burst native async httpx pipeline + findings renderer
 │   │   ├── providers.py       # Jina, Exa, Tavily, Apify LinkedIn clients
 │   │   └── sources.py         # URL heuristics, authwall unwrapping, deduplication
 │   ├── agents/
 │   │   ├── base.py            # prompt frontmatter loader, JSON validation, Proposal helper
-│   │   ├── osint.py           # burst engine + 900-tok synthesis + disk cache
-│   │   ├── profile.py         # 512-tok target modeling + disclosure classification
-│   │   ├── identity.py        # manifest, ComfyUI image wiring, direct landing-page render
-│   │   ├── landing_pages.py   # 6 authored QA-safe harvest HTML templates + field-safe selector
+│   │   ├── osint.py           # burst engine + 900-tok synthesis + disk cache + thin-OSINT short-circuit
+│   │   ├── profile.py         # 512-tok target modeling + disclosure extraction (replies/forms/calls)
+│   │   ├── identity.py        # manifest, wrap_email_html (3 styles), ComfyUI wiring, direct page render
+│   │   ├── landing_pages.py   # 8 authored QA-safe HTML templates + field-safe harvest selector
+│   │   ├── visual_artifacts.py# Playwright PNG briefing/agenda sheet renderer
 │   │   ├── domains.py         # deterministic lookalike domain generator + email derivation
-│   │   ├── messaging.py       # in-character compose/live_turn + signal extraction + style lint
-│   │   ├── strategy.py        # 768-tok rolling 5-touch planner + constraint validator/repair
-│   │   └── qa.py              # deterministic DOM/domain/placeholder checks + LLM craft review
+│   │   ├── messaging.py       # 22-channel compose/live_turn, StoryClock, signal extraction, style lint
+│   │   ├── strategy.py        # 768-tok rolling 5-touch planner + multi-page validator/repair
+│   │   └── qa.py              # DOM/domain/placeholder/past-date checks + LLM craft review
 │   ├── api/
-│   │   ├── client.py          # httpx: Idempotency-Key, retries, page-before-link, asset cap
+│   │   ├── client.py          # httpx: Idempotency-Key, 429/502/503/504 retries, 409 disambiguation, /channels
 │   │   └── limits.py          # token-bucket rate governor + concurrency semaphore
 │   ├── llm/
 │   │   ├── text.py            # OpenAI-compatible streaming client (Qwen3.8-27B / OpenAI)
@@ -494,50 +509,52 @@ agentic-social-honey-pot/
 │   ├── render/
 │   │   └── screenshot.py      # Playwright headless Chromium → PNG + DOM telemetry
 │   ├── store/
-│   │   └── db.py              # SQLite WAL (5s busy_timeout): events, decisions, snapshots, assets, pages
+│   │   ├── db.py              # SQLite WAL (5s busy_timeout): events, decisions, snapshots, assets, pages
+│   │   ├── asset_cache.py     # team-wide atomic SHA-256 asset cache (data/team_assets.json)
+│   │   └── memory.py          # cross-session TargetMemoryStore (data/memory/)
 │   └── web/
-│       ├── server.py          # FastAPI read-only API + SSE stream + practice launch controls
-│       ├── queries.py         # SQLite WAL → dashboard JSON projections & version snapshots
-│       ├── runner.py          # background practice subprocess manager + per-run log capture
+│       ├── server.py          # FastAPI API + SSE stream + practice & guarded eval launch endpoints
+│       ├── queries.py         # SQLite WAL → dashboard JSON projections, execution_status & snapshots
+│       ├── runner.py          # subprocess manager (practice + 5-per-persona/15-total eval guards)
 │       ├── demo_seed.py       # seeded demo databases for pitch/UI verification
 │       └── offline_replay.py  # deterministic offline replay fixture generator
-├── frontend/                  # Next.js + Tailwind + Recharts live monitor & version scrubber
+├── frontend/                  # Next.js + Tailwind + Recharts monitor, RunExecutionStatus, Run Eval modal
 ├── scripts/
+│   ├── eval_scout.py          # 0-touch /v1/scenarios + parallel OSINT cache warming
+│   ├── prewarm_osint.py       # batch OSINT dossier pre-warmer
+│   ├── preflight.py           # live service & model health check
+│   ├── run_overnight.py       # autonomous practice batch runner
+│   ├── audit_overnight.py     # batch run audit report generator
 │   ├── summarize_runs.py      # read-only offline run metadata & exit-reason summarizer
 │   └── test_osint_live.py     # live OSINT provider smoke test
 ├── tools/
 │   └── replay.py              # decision log → Markdown/text timeline for pitch/docs
 └── tests/
-    ├── mock_api/              # FastAPI mock Target API with scripted personas
-    └── unit/                  # 95+ unit & Playwright/E2E integration tests
+    ├── mock_api/              # FastAPI mock Target API (channels, story_time 409, 10-turn calls, masking)
+    └── unit/                  # 131 unit, Playwright QA & E2E integration tests
 ```
 
 ## 13. Testing & Practice Plan
 
-1. **Unit tests**: budget governor, idempotency retry, domain plausibility checker, confidence mapping, snapshot versioning/stale rejection, trigger policy caps.
-2. **Dry runs (mock API)**: full campaign against 4 scripted persona types. Assert: all JSON valid, budget never exceeded, page-before-link holds, win detection fires, state transitions correct, crash-recovery replay works.
-3. **Practice loop (real API, julius/tom/robert)**:
-   - Run the full stack end-to-end; use `tools/replay.py` to review every decision.
-   - A/B strategy configs (opener channel, escalation curve, pacing) via `config.yaml`.
-   - Use `tools/critic.py` (frontier model, offline) to grade craft and message quality; iterate prompts.
-   - Validate API ambiguities in practice: do conversation *turns* cost touches? How fast do twins reply? Which channels do practice twins engage on?
-4. **Freeze** prompts + config ≥1 day before eval. No prompt changes between eval runs.
+1. **Unit & Playwright tests (`uv run pytest -q`, 131 tests):** API parity & 409 disambiguation, `TeamAssetCache`, `classify_page_submission` & `TargetMemoryStore`, all 8 landing-page templates + `wrap_email_html` + `render_visual_artifact_png` + `check_past_dates`, 22-channel sender resolution, 10-turn live conversations costing 1 touch, `StoryClock` monotonicity & recovery, and FastAPI/eval guard endpoints.
+2. **Dry runs (mock API):** full campaigns against scripted eager / cautious / suspicious / silent personas in `tests/mock_api/`.
+3. **Practice loop (real API, `julius` / `tom` / `robert`):** iterate via dashboard or `scripts/run_overnight.py` + `scripts/audit_overnight.py` + `tools/replay.py`.
 
-## 14. Eval Runbook
+## 14. Eval Runbook (5 Tries per Persona · 15 Sessions Total · Best 2 Scored)
 
-- **T−24h**: 3 clean dry runs on mock; critic pass on all artifact types; model servers health-checked; env keys verified.
-- **T−2h**: ping Target API, validate `TEAM_KEY`, one 3-touch practice session end-to-end (confirms serving + API + render in the venue env).
-- **Run 1**: proven conservative config (full 10-touch plan, pacing 15 min).
-- **Run 2**: same proven config — median protection (2 of 3 runs identical).
-- **Run 3**: same proven config, or the practice-validated v2. Never something new on run 3.
-- **Between runs**: runs are independent (session-agnostic memory); re-run OSINT only if cheap and target changed; keep all decision logs.
-- **If window is short (<90 min)**: switch to aggressive config (pacing 5 min, compressed plan).
-- **After**: `tools/replay.py` on all 3 runs → pick the best thread → pitch walkthrough (hook found at touch N → pivot → incident at touch M).
+- **Pre-flight:** Run `uv run python scripts/preflight.py` (verifies LLM, ComfyUI, and OSINT keys). Optionally run `uv run python scripts/eval_scout.py` (0 touches spent) once the eval window is open to pre-warm OSINT caches for all 3 personas.
+- **Launch via Dashboard or CLI:**
+  - Dashboard: click **Run Eval** (under **New Practice Run**), click **Load Eval Targets** (read-only `GET /v1/scenarios`), select 1–3 personas, confirm, and start. Each launched run is locked to `--max-sessions 1` (10 touches) with `--zero-pacing --aggressive` (`StoryClock` still supplies realistic simulated timestamps).
+  - CLI: `uv run python -m src.main --scenario eval --target <id> --run-no <1..5> --max-sessions 1 --zero-pacing --aggressive`.
+- **Iterative exploitation across 5 tries (3 throwaway + 2 best scored):**
+  - Run **Try 1** per persona, inspect the thread/watchouts/hooks live on the dashboard (`http://localhost:3000`).
+  - `TargetMemoryStore` (`data/memory/`) automatically carries verified facts, hook engagement scores, watchouts, and channel outcomes into **Tries 2–5** while resetting the target's session memory.
+- **After:** Run `tools/replay.py` on the best eval DBs to prepare the 5-minute jury pitch walkthrough.
 
 ## 15. Deliverable Mapping
 
 | Deliverable | Source |
 |---|---|
-| 1-page architecture doc | extract §3 (principles) + §4 (diagram) + §5.2 (OSINT skill) + §6 (state machine) from this file |
-| 5-min pitch | architecture rationale (principles + why single-writer) + replay walkthrough of best run |
-| API scoring runs | `src/main.py` eval mode, 3 runs per runbook |
+| 1-page architecture doc | extract §3 (principles) + §4 (diagram) + §5 (agents & live calls) + §6 (state machine) from this file |
+| 5-min pitch | architecture rationale + live dashboard playback (`http://localhost:3000`) + `tools/replay.py` walkthrough |
+| API scoring runs | Dashboard **Run Eval** button or `src/main.py --scenario eval --max-sessions 1` (up to 5 tries × 3 personas) |

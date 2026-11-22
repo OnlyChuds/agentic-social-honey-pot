@@ -86,3 +86,7 @@ uv run python -m src.web.server --viewer --data-dir data --port 8001
 
 Then start the frontend from `frontend/` with
 `FASTAPI_URL=http://127.0.0.1:8001 npm run dev`.
+
+---
+
+> **Follow-up status (`main`):** All three improvements above have since been implemented: the live orchestrator now records `stage_start`, `stage_timing`, and `run_exit` events (`completed` / `stopped` / `cycle_limit` / `service_failure`), surfaced live in `RunExecutionStatus.tsx`, and the offline replay + mock-API E2E suite now runs 131 automated tests.
