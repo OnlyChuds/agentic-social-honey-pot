@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -102,6 +103,45 @@ class Orchestrator:
         self._consecutive_rejections: int = 0
         self._consecutive_msg_failures: int = 0
         self._last_signal_payload: dict[str, Any] | None = None
+        self._campaign_memory: dict[str, Any] = {
+            "registered_urls": [],
+            "mentioned_urls": [],
+            "mentioned_dates": [],
+            "subjects": [],
+        }
+
+    def _record_campaign_memory(
+        self,
+        *,
+        body: str = "",
+        subject: str | None = None,
+        registered_url: str | None = None,
+    ) -> None:
+        """Freeze key dates, URLs, and subjects across sessions so restarts never contradict."""
+        if registered_url and registered_url not in self._campaign_memory["registered_urls"]:
+            self._campaign_memory["registered_urls"].append(registered_url)
+        if subject and subject.strip():
+            clean_s = re.sub(r"^(?:re:\s*)+", "", subject.strip(), flags=re.IGNORECASE)
+            if clean_s and clean_s not in self._campaign_memory["subjects"]:
+                self._campaign_memory["subjects"].append(clean_s)
+                self._campaign_memory["subjects"] = self._campaign_memory["subjects"][-6:]
+        if body:
+            for m in re.finditer(r"https?://[^\s<>\"')]+", body, re.IGNORECASE):
+                u = m.group(0).rstrip(".,;:!?")
+                if u not in self._campaign_memory["mentioned_urls"]:
+                    self._campaign_memory["mentioned_urls"].append(u)
+                    self._campaign_memory["mentioned_urls"] = self._campaign_memory["mentioned_urls"][-8:]
+            for m in re.finditer(
+                r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+                r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+                r"Dec(?:ember)?)\s+\d{1,2}(?:,\s*20\d{2})?\b|\bQ[1-4]\s*20\d{2}\b",
+                body,
+                re.IGNORECASE,
+            ):
+                d_str = m.group(0).strip()
+                if d_str not in self._campaign_memory["mentioned_dates"]:
+                    self._campaign_memory["mentioned_dates"].append(d_str)
+                    self._campaign_memory["mentioned_dates"] = self._campaign_memory["mentioned_dates"][-6:]
 
     @property
     def snapshot(self) -> Snapshot:
@@ -439,7 +479,20 @@ class Orchestrator:
             return page_url
 
         if next_touch_n < spec.trigger_touch:
-            return None
+            last_in = next(
+                (t for t in reversed(self.snapshot.conversation.turns) if t.dir == "in"),
+                None,
+            )
+            asked_for_url = bool(
+                last_in is not None
+                and re.search(
+                    r"\b(?:url|link|website|web\s*page|event\s+page|landing\s+page|registration\s+page|portal)\b",
+                    last_in.body,
+                    re.IGNORECASE,
+                )
+            )
+            if not asked_for_url:
+                return None
 
         title = spec.pretext or "Verification Portal"
         fields = list(spec.fields) if spec.fields else ["email", "password"]
@@ -506,6 +559,7 @@ class Orchestrator:
             html=html,
             fields=fields,
         )
+        self._record_campaign_memory(registered_url=page_url)
         actions.append(_action("register_page", url=page_url, title=title, fields=fields))
         return page_url
 
@@ -583,6 +637,7 @@ class Orchestrator:
             self.agents.strategy,
             mode="plan",
             reason="fresh session started",
+            campaign_memory=dict(self._campaign_memory),
         )
         if replan is not None:
             actions.extend(self._actions_from_commits([self.state.commit_proposal(replan)]))
@@ -643,6 +698,7 @@ class Orchestrator:
 
         touch_spec = self._next_touch_spec()
         registered_url = await self._ensure_landing_page_registered(touch_spec.n, actions)
+        session_registered_urls = [p.url for p in self.state.store.get_pages_for_session(session_id)]
 
         # Compose message (use live_turn mode for live voice/chat channels)
         compose_mode = "live_turn" if self.policy.is_live_channel(touch_spec.channel) else "compose"
@@ -653,6 +709,8 @@ class Orchestrator:
             channel=touch_spec.channel,
             touch=touch_spec.model_dump(mode="json"),
             registered_page_url=registered_url,
+            known_registered_urls=session_registered_urls,
+            campaign_memory=dict(self._campaign_memory),
             latest_signal=self._last_signal_payload,
         )
         if msg_prop is None:
@@ -697,6 +755,8 @@ class Orchestrator:
                     channel=touch_spec.channel,
                     touch=touch_spec.model_dump(mode="json"),
                     registered_page_url=registered_url,
+                    known_registered_urls=session_registered_urls,
+                    campaign_memory=dict(self._campaign_memory),
                     latest_signal=self._last_signal_payload,
                     qa_feedback=verdict.model_dump(mode="json", by_alias=True),
                 )
@@ -803,6 +863,7 @@ class Orchestrator:
         body = str(msg_prop.payload.get("say") or msg_prop.payload["body"])
         subject_raw = msg_prop.payload.get("subject")
         subject = str(subject_raw) if subject_raw is not None else None
+        self._record_campaign_memory(body=body, subject=subject)
         attachments = msg_prop.payload.get("attachments") or None
         sent_at_raw = msg_prop.payload.get("sent_at")
         sent_at = str(sent_at_raw) if sent_at_raw else None
@@ -1102,6 +1163,7 @@ class Orchestrator:
                 self.agents.strategy,
                 mode="pivot",
                 reason=pivot_reason,
+                campaign_memory=dict(self._campaign_memory),
             )
             self.policy.mark_strategy_pivoted()
             if strat_prop is not None:

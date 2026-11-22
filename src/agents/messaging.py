@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 from src.agents.base import BaseAgent
-from src.agents.identity import wrap_branded_email_html
+from src.agents.identity import _linkify_html_fragment, wrap_branded_email_html
 from src.agents.qa import check_disallowed_meta_text, check_placeholders
 from src.llm.text import TextLLMClient
 from src.models import (
@@ -75,6 +75,8 @@ _PHANTOM_ATTACHMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _SUBJECT_BODY_LEAK_RE = re.compile(r"\b(?:hi|hello|hey)\s+[A-Z][a-z]+,", re.IGNORECASE)
+_STACKED_RE_PREFIX_RE = re.compile(r"^(?:re:\s*){2,}", re.IGNORECASE)
+_ASSET_ID_STR_RE = re.compile(r"^(?:asset://)?a_[A-Za-z0-9_-]+$")
 SUBJECT_MAX_CHARS = 90
 
 
@@ -324,6 +326,7 @@ def enforce_channel_limits(draft: MessageDraft) -> tuple[MessageDraft, list[str]
 
     if updated.subject is not None:
         cleaned_subj = re.sub(r"\s+", " ", updated.subject).strip()
+        cleaned_subj = _STACKED_RE_PREFIX_RE.sub("Re: ", cleaned_subj)
         leak_match = _SUBJECT_BODY_LEAK_RE.search(cleaned_subj)
         if leak_match and leak_match.start() > 0:
             cleaned_subj = cleaned_subj[: leak_match.start()].strip(" -:;,")
@@ -338,6 +341,23 @@ def enforce_channel_limits(draft: MessageDraft) -> tuple[MessageDraft, list[str]
     ):
         updated.subject = "Quick follow-up"
         warnings.append(f"Added fallback subject for channel '{updated.channel}'.")
+
+    # Convert any stray bare non-asset filename strings into valid virtual attachment dicts
+    if updated.attachments:
+        normalized_atts: list[str | dict[str, Any]] = []
+        for item in updated.attachments:
+            if isinstance(item, str):
+                raw = item.strip()
+                if _ASSET_ID_STR_RE.match(raw):
+                    normalized_atts.append(raw.removeprefix("asset://"))
+                elif raw:
+                    normalized_atts.append({"filename": Path(raw).name})
+                    warnings.append(
+                        f"Converted bare attachment filename '{raw}' to virtual attachment object."
+                    )
+            else:
+                normalized_atts.append(item)
+        updated.attachments = normalized_atts
 
     att_limit = MAX_TURN_ATTACHMENTS if updated.channel in LIVE_CHANNELS else MAX_MESSAGE_ATTACHMENTS
     if len(updated.attachments) > att_limit:
@@ -376,6 +396,14 @@ def lint_message_style(draft: MessageDraft) -> list[str]:
             "either include a concrete attachment or remove the 'attached' wording."
         )
 
+    for att in draft.attachments:
+        if isinstance(att, str) and not _ASSET_ID_STR_RE.match(att.strip()):
+            issues.append(
+                f"Bare filename string '{att}' in `attachments` is not a valid uploaded asset ID — "
+                "use a virtual object `{\"filename\": ..., \"transcript\": \"...detailed contents...\"}` "
+                "or omit the attachment."
+            )
+
     for placeholder_issue in check_placeholders(combined):
         issues.append(placeholder_issue.fix)
 
@@ -383,6 +411,76 @@ def lint_message_style(draft: MessageDraft) -> list[str]:
         issues.append(meta_issue.fix)
 
     return issues
+
+
+_ATTACHMENT_AVERSION_RE = re.compile(
+    r"(?:no\s+attachments?|don'?t\s+open\s+attachments?|won'?t\s+open\s+(?:the\s+)?attachments?|"
+    r"refus(?:es|ed)\s+attachments?|skeptical\s+of\s+attachments?|avoid\s+attachments?)",
+    re.IGNORECASE,
+)
+_SELF_URL_RE = re.compile(r"https?://([a-z0-9.-]+)(/[^\s<>\"')]*)", re.IGNORECASE)
+
+
+def attachments_disallowed(
+    snapshot: Snapshot,
+    *,
+    is_first_contact: bool,
+    latest_signal: SignalAssessment | dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Deterministic hard rule: block attachments when target dislikes them or trust is unestablished."""
+    for watchout in snapshot.profile.watchouts:
+        if _ATTACHMENT_AVERSION_RE.search(watchout):
+            return True, f"profile watchout forbids attachments ({watchout})"
+    for turn in snapshot.conversation.turns[-6:]:
+        if turn.dir == "in" and _ATTACHMENT_AVERSION_RE.search(turn.body):
+            return True, "target explicitly refused attachments in conversation"
+
+    plan = snapshot.campaign.plan
+    is_explicit_action = plan is not None and plan.objective == "action" and bool(plan.action_artifact)
+    suspicion = 0.0
+    if isinstance(latest_signal, SignalAssessment):
+        suspicion = latest_signal.suspicion
+    elif isinstance(latest_signal, dict) and latest_signal.get("suspicion") is not None:
+        try:
+            suspicion = float(latest_signal["suspicion"])
+        except (TypeError, ValueError):
+            suspicion = 0.0
+
+    if is_first_contact and not is_explicit_action:
+        return True, "no attachments on first contact before rapport is established"
+    if suspicion >= 0.5:
+        return True, f"suspicion {suspicion:.2f} >= 0.50 (attachments disabled until trust improves)"
+    return False, ""
+
+
+def _ensure_registered_url_anchored(
+    body: str,
+    *,
+    registered_page_url: str | None,
+    manifest: BrandingManifest | None,
+) -> str:
+    """Ensure bare URLs are clickable <a> tags and registered_page_url is anchored in HTML emails."""
+    accent = (
+        manifest.palette[1]
+        if manifest is not None and len(manifest.palette) > 1 and manifest.palette[1].startswith("#")
+        else "#2563eb"
+    )
+    updated = _linkify_html_fragment(body, accent)
+    if registered_page_url and registered_page_url not in updated:
+        cta_p = (
+            '<p style="margin:14px 0 0 0;line-height:1.55;">'
+            f'<a href="{html_lib.escape(registered_page_url, quote=True)}" '
+            f'style="color:{accent};text-decoration:underline;font-weight:500;">'
+            f"{html_lib.escape(registered_page_url)}</a></p>"
+        )
+        sig_idx = updated.find('<table role="presentation"')
+        if sig_idx != -1:
+            updated = updated[:sig_idx] + cta_p + updated[sig_idx:]
+        elif "</body>" in updated.lower():
+            updated = re.sub(r"</body>", f"{cta_p}</body>", updated, count=1, flags=re.IGNORECASE)
+        else:
+            updated = updated + cta_p
+    return updated
 
 
 class MessagingAgent(BaseAgent):
@@ -416,6 +514,8 @@ class MessagingAgent(BaseAgent):
         touch_spec: TouchSpec | None = None,
         latest_signal: SignalAssessment | dict[str, Any] | None = None,
         registered_page_url: str | None = None,
+        known_registered_urls: Sequence[str] | None = None,
+        campaign_memory: dict[str, Any] | None = None,
         qa_feedback: QAVerdict | None = None,
         rejection_feedback: str | None = None,
         sent_at: str | None = None,
@@ -426,6 +526,17 @@ class MessagingAgent(BaseAgent):
         """Compose a schema-validated outbound message proposal for the next planned touch."""
         active_touch = touch_spec or self._next_planned_touch(snapshot)
         is_first_contact = snapshot.campaign.budget.used == 0 and not snapshot.conversation.turns
+        no_attach, no_attach_reason = attachments_disallowed(
+            snapshot,
+            is_first_contact=is_first_contact,
+            latest_signal=latest_signal,
+        )
+        allowed_self_urls = {
+            u.rstrip("/").lower()
+            for u in ([registered_page_url] if registered_page_url else [])
+            + list(known_registered_urls or ())
+            if u
+        }
 
         ranked_hooks = sorted(
             [h for h in snapshot.hooks if h.status != "exhausted"],
@@ -443,6 +554,10 @@ class MessagingAgent(BaseAgent):
             "touch": active_touch.model_dump(mode="json") if active_touch is not None else None,
             "conversation": _compact_conversation_for_llm(snapshot),
             "registered_page_url": registered_page_url,
+            "known_registered_urls": sorted(allowed_self_urls),
+            "frozen_campaign_memory": campaign_memory or {},
+            "attachments_disallowed": no_attach,
+            "attachments_disallowed_reason": no_attach_reason if no_attach else "",
             "is_first_contact": is_first_contact,
         }
         if latest_signal is not None:
@@ -456,15 +571,46 @@ class MessagingAgent(BaseAgent):
         if rejection_feedback is not None:
             context["rejection_feedback"] = rejection_feedback
 
+        def _extra_guard_issues(d: MessageDraft) -> list[str]:
+            extra: list[str] = []
+            if no_attach and d.attachments:
+                extra.append(
+                    f"Attachments are forbidden right now ({no_attach_reason}) — "
+                    "set `attachments` to [] and remove any mention of attached files."
+                )
+            sender_dom = (
+                snapshot.identity.domain.strip().lower()
+                if snapshot.identity and snapshot.identity.domain
+                else ""
+            )
+            if sender_dom:
+                for m in _SELF_URL_RE.finditer(d.body):
+                    host = m.group(1).lower()
+                    full_u = m.group(0).rstrip(".,;:!?").rstrip("/").lower()
+                    if host == sender_dom and full_u not in allowed_self_urls:
+                        if registered_page_url:
+                            extra.append(
+                                f"Unregistered URL '{m.group(0)}' on '{sender_dom}' — "
+                                f"use the exact registered URL '{registered_page_url}' instead."
+                            )
+                        else:
+                            extra.append(
+                                f"Unregistered URL '{m.group(0)}' on '{sender_dom}' — "
+                                "remove invented links until a landing page is registered."
+                            )
+            return extra
+
         draft = await self.run_json(context, MessageDraft)
-        lint_issues = lint_message_style(draft)
+        lint_issues = [*lint_message_style(draft), *_extra_guard_issues(draft)]
         if lint_issues and auto_rewrite:
             retry_context = dict(context)
             retry_context["previous_draft"] = draft.model_dump(mode="json")
             retry_context["style_lint_issues"] = lint_issues
             draft = await self.run_json(retry_context, MessageDraft)
-            lint_issues = lint_message_style(draft)
+            lint_issues = [*lint_message_style(draft), *_extra_guard_issues(draft)]
 
+        if no_attach and draft.attachments:
+            draft.attachments = []
         draft, limit_warnings = enforce_channel_limits(draft)
         if snapshot.identity is not None and snapshot.identity.sender_name:
             draft.body = re.sub(
@@ -515,6 +661,15 @@ class MessagingAgent(BaseAgent):
                 subject=draft.subject or "",
                 body_html=draft.body,
                 portrait_ref=effective_portrait,
+            )
+
+        if draft.channel == "email" and (
+            "<!doctype html>" in draft.body.lower() or "<p" in draft.body.lower()
+        ):
+            draft.body = _ensure_registered_url_anchored(
+                draft.body,
+                registered_page_url=registered_page_url,
+                manifest=snapshot.identity,
             )
 
         warnings = [*limit_warnings, *fact_warnings, *lint_issues]
@@ -684,6 +839,8 @@ class MessagingAgent(BaseAgent):
             touch_spec=touch_spec,
             latest_signal=kwargs.get("latest_signal"),
             registered_page_url=kwargs.get("registered_page_url"),
+            known_registered_urls=kwargs.get("known_registered_urls"),
+            campaign_memory=kwargs.get("campaign_memory"),
             qa_feedback=qa_feedback,
             rejection_feedback=kwargs.get("rejection_feedback"),
             sent_at=kwargs.get("sent_at"),

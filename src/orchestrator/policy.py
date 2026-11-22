@@ -108,6 +108,12 @@ class TriggerPolicy:
             self.state.consecutive_no_reply = 0
         else:
             self.state.consecutive_no_reply += 1
+            # Silence-decay term so silent streaks register as declining engagement
+            decayed = round(max(0.0, self.state.last_engagement * 0.7), 3)
+            self.state.last_engagement = decayed
+            self.state.recent_engagements.append(decayed)
+            if len(self.state.recent_engagements) > 5:
+                self.state.recent_engagements = self.state.recent_engagements[-5:]
 
         self.state.events_since_profile += event_count
 
@@ -179,10 +185,14 @@ class TriggerPolicy:
                 f"{self.suspicion_pivot_threshold:.2f} "
                 f"(engagement={self.state.last_engagement:.2f})"
             )
-        if self.state.same_channel_streak >= 3 and self._engagement_is_declining():
+        if (
+            self.state.same_channel_streak >= 3
+            and self.state.same_channel_streak % 3 == 0
+            and (self._engagement_is_declining() or self.state.consecutive_no_reply >= 2)
+        ):
             return (
                 f"{self.state.same_channel_streak} same-channel touches "
-                f"({self.state.last_channel}) with declining engagement"
+                f"({self.state.last_channel}) with declining engagement or silence"
             )
         return None
 
