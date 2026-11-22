@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -74,6 +75,58 @@ _PLACEHOLDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Double-brace template token", re.compile(r"\{\{[^{}]+\}\}")),
     ("Single-brace variable token", re.compile(r"\{[A-Za-z_][A-Za-z0-9_.-]{0,30}\}")),
     ("Example placeholder domain", re.compile(r"\bexample\.(?:com|org|net)\b", re.IGNORECASE)),
+    (
+        "Generic role placeholder",
+        re.compile(
+            r"\b(?:Speaker|Panelist|Presenter|Guest|Moderator|Participant)\s+(?:[1-9]|[A-Z])\b",
+        ),
+    ),
+    (
+        "Generic org placeholder",
+        re.compile(r"\b(?:Company|Organization|Org|Vendor|Client)\s+[XYZ]\b"),
+    ),
+)
+
+_MONTH_NAME_MAP: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_PATTERN = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+)
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
+_DMY_DATE_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*[-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?)?\s+"
+    rf"({_MONTH_PATTERN})\.?(?:,?\s+(20\d{{2}}))?\b",
+    re.IGNORECASE,
+)
+_MDY_DATE_RE = re.compile(
+    rf"\b({_MONTH_PATTERN})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+    rf"(?:\s*[-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?)?(?:,\s*(20\d{{2}})|\s+(20\d{{2}}))?\b",
+    re.IGNORECASE,
 )
 
 _DISALLOWED_META_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -467,6 +520,66 @@ def check_disallowed_meta_text(text: str) -> list[QAIssue]:
     return issues
 
 
+def _safe_date(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def check_past_dates(text: str, *, reference_date: date) -> list[QAIssue]:
+    """Flag explicit calendar dates in text that fall strictly before ``reference_date``."""
+    issues: list[QAIssue] = []
+    seen: set[str] = set()
+
+    def _record_if_past(raw_match: str, candidate: date | None, *, has_explicit_year: bool) -> None:
+        if candidate is None or candidate >= reference_date:
+            return
+        if not has_explicit_year and (reference_date - candidate).days > 180:
+            # e.g. mentioning "15 Jan" in late November refers to next January, not 10 months ago.
+            return
+        key = raw_match.strip().lower()
+        if key in seen:
+            return
+        seen.add(key)
+        issues.append(
+            QAIssue(
+                criterion="detail_precision",
+                severity="major",
+                fix=(
+                    f"Date '{raw_match.strip()}' ({candidate.isoformat()}) is in the past relative "
+                    f"to {reference_date.isoformat()}. Replace with an upcoming date."
+                ),
+            )
+        )
+
+    for match in _ISO_DATE_RE.finditer(text):
+        parsed = _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        _record_if_past(match.group(0), parsed, has_explicit_year=True)
+
+    for match in _DMY_DATE_RE.finditer(text):
+        day_end = int(match.group(2) or match.group(1))
+        month_num = _MONTH_NAME_MAP.get(match.group(3).lower().rstrip("."))
+        if month_num is None:
+            continue
+        year_str = match.group(4)
+        year = int(year_str) if year_str else reference_date.year
+        parsed = _safe_date(year, month_num, day_end)
+        _record_if_past(match.group(0), parsed, has_explicit_year=bool(year_str))
+
+    for match in _MDY_DATE_RE.finditer(text):
+        month_num = _MONTH_NAME_MAP.get(match.group(1).lower().rstrip("."))
+        if month_num is None:
+            continue
+        day_end = int(match.group(3) or match.group(2))
+        year_str = match.group(4) or match.group(5)
+        year = int(year_str) if year_str else reference_date.year
+        parsed = _safe_date(year, month_num, day_end)
+        _record_if_past(match.group(0), parsed, has_explicit_year=bool(year_str))
+
+    return issues
+
+
 def run_deterministic_checks(
     *,
     html: str,
@@ -476,6 +589,7 @@ def run_deterministic_checks(
     expected_url: str | None = None,
     landing_page_spec: LandingPageSpec | None = None,
     extra_blocked_domains: Iterable[str] = (),
+    reference_date: date | None = None,
 ) -> list[QAIssue]:
     """Execute all code-level static and rendered QA checks."""
     issues: list[QAIssue] = []
@@ -508,6 +622,8 @@ def run_deterministic_checks(
         )
 
     issues.extend(check_placeholders(visible_text, html))
+    if reference_date is not None:
+        issues.extend(check_past_dates(visible_text, reference_date=reference_date))
     issues.extend(
         check_manifest_consistency(
             visible_text,
@@ -601,6 +717,7 @@ class QAAgent(BaseAgent):
         expected_url: str | None = None,
         landing_page_spec: LandingPageSpec | None = None,
         extra_blocked_domains: Iterable[str] = (),
+        reference_date: date | None = None,
         revision_cycle: int = 0,
         render: bool = True,
         run_llm: bool = True,
@@ -632,6 +749,7 @@ class QAAgent(BaseAgent):
             expected_url=expected_url,
             landing_page_spec=landing_page_spec,
             extra_blocked_domains=extra_blocked_domains,
+            reference_date=reference_date,
         )
 
         llm_issues: list[QAIssue] = []
@@ -643,6 +761,7 @@ class QAAgent(BaseAgent):
             context_payload: dict[str, Any] = {
                 "channel": channel,
                 "render_mode": mode,
+                "reference_date": reference_date.isoformat() if reference_date else None,
                 "target": snapshot.target.model_dump(mode="json"),
                 "manifest": (
                     snapshot.identity.model_dump(mode="json")
@@ -755,6 +874,16 @@ class QAAgent(BaseAgent):
         ):
             landing_page_spec = snapshot.campaign.plan.landing_page
 
+        raw_ref_date = kwargs.get("reference_date")
+        reference_date: date | None = None
+        if isinstance(raw_ref_date, date):
+            reference_date = raw_ref_date
+        elif isinstance(raw_ref_date, str) and raw_ref_date.strip():
+            try:
+                reference_date = date.fromisoformat(raw_ref_date.strip()[:10])
+            except ValueError:
+                reference_date = None
+
         _, proposal, _ = await self.evaluate(
             snapshot,
             html=html,
@@ -766,6 +895,7 @@ class QAAgent(BaseAgent):
             expected_url=kwargs.get("expected_url"),
             landing_page_spec=landing_page_spec,
             extra_blocked_domains=kwargs.get("extra_blocked_domains", ()),
+            reference_date=reference_date,
             revision_cycle=int(revision_raw),
             render=bool(kwargs.get("render", True)),
             run_llm=bool(kwargs.get("run_llm", True)),
@@ -785,6 +915,7 @@ async def run_qa_loop[T](
     expected_url: str | None = None,
     landing_page_spec: LandingPageSpec | None = None,
     extra_blocked_domains: Iterable[str] = (),
+    reference_date: date | None = None,
     render: bool = True,
     run_llm: bool = True,
 ) -> QALoopResult:
@@ -806,6 +937,7 @@ async def run_qa_loop[T](
             expected_url=expected_url,
             landing_page_spec=landing_page_spec,
             extra_blocked_domains=extra_blocked_domains,
+            reference_date=reference_date,
             revision_cycle=cycle,
             render=render,
             run_llm=run_llm,

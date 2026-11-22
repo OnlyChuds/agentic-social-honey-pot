@@ -13,6 +13,7 @@ import httpx
 
 from src.api.limits import RateGovernor
 from src.config import TargetApiConfig
+from src.store.asset_cache import TeamAssetCache
 from src.store.db import MAX_ASSETS_DEFAULT, AssetCapError, AssetRecord, Store
 
 SleepFn = Callable[[float], Awaitable[None]]
@@ -46,6 +47,14 @@ class BudgetExhaustedError(TargetAPIError):
     """Raised on HTTP 409 (touch budget exhausted, session ended, or eval runs exhausted)."""
 
 
+class ConversationEndedError(TargetAPIError):
+    """Raised on HTTP 409 when a live conversation has already ended or hit its turn limit."""
+
+
+class StoryTimeError(TargetAPIError):
+    """Raised on HTTP 409 when ``sent_at`` regresses earlier than the session's ``story_time``."""
+
+
 class SimulatorRejectionError(TargetAPIError):
     """Raised on HTTP 422 (rejected by simulator/persona model — do not retry blindly)."""
 
@@ -71,6 +80,7 @@ class TargetAPIClient:
         timeout_s: float = 120.0,
         store: Store | None = None,
         max_assets: int = MAX_ASSETS_DEFAULT,
+        asset_cache: TeamAssetCache | None = None,
         client: httpx.AsyncClient | None = None,
         sleep: SleepFn = asyncio.sleep,
     ) -> None:
@@ -80,6 +90,12 @@ class TargetAPIClient:
         self.backoff_s = list(backoff_s) if backoff_s is not None else [30, 60, 90]
         self.store = store
         self.max_assets = max_assets
+        if asset_cache is not None:
+            self.asset_cache: TeamAssetCache | None = asset_cache
+        elif store is not None and str(store.db_path) != ":memory:":
+            self.asset_cache = TeamAssetCache(store.db_path.parent / "team_assets.json")
+        else:
+            self.asset_cache = None
         self._sleep = sleep
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -90,6 +106,7 @@ class TargetAPIClient:
         # In-memory mirrors used when no Store is attached (or as fast cache)
         self._registered_pages: dict[str, set[str]] = {}
         self._uploaded_assets_by_sha: dict[str, AssetRecord] = {}
+        self._channels_cache: list[dict[str, Any]] | None = None
 
     @classmethod
     def from_config(
@@ -233,9 +250,9 @@ class TargetAPIClient:
                 await self._sleep(delay)
                 continue
 
-            if status == 503:
+            if status in {502, 503, 504}:
                 if attempt >= len(self.backoff_s):
-                    raise TargetAPIError(503, detail, retryable=True)
+                    raise TargetAPIError(status, detail, retryable=True)
                 await self._sleep(float(self.backoff_s[attempt]))
                 continue
 
@@ -243,6 +260,16 @@ class TargetAPIClient:
                 raise SimulatorRejectionError(422, detail, retryable=False)
 
             if status == 409:
+                lower = detail.lower()
+                if any(
+                    tok in lower
+                    for tok in ("story_time", "sent_at", "earlier than", "backwards", "chronolog", "timestamp")
+                ):
+                    raise StoryTimeError(409, detail, retryable=False)
+                if "conversation" in lower and any(
+                    tok in lower for tok in ("ended", "closed", "max turns", "turn limit", "complete")
+                ):
+                    raise ConversationEndedError(409, detail, retryable=False)
                 raise BudgetExhaustedError(409, detail, retryable=False)
 
             raise TargetAPIError(status, detail, retryable=False)
@@ -256,6 +283,19 @@ class TargetAPIClient:
         if not isinstance(data, list):
             raise TargetAPIError(500, f"Expected list from /scenarios, got {type(data).__name__}")
         return data
+
+    async def get_channels(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+        if self._channels_cache is not None and not force_refresh:
+            return [dict(c) for c in self._channels_cache]
+        data = await self._request("GET", "/channels", mutating=False)
+        if isinstance(data, dict) and isinstance(data.get("channels"), list):
+            channels = [dict(c) for c in data["channels"] if isinstance(c, dict)]
+        elif isinstance(data, list):
+            channels = [dict(c) for c in data if isinstance(c, dict)]
+        else:
+            channels = []
+        self._channels_cache = channels
+        return [dict(c) for c in channels]
 
     # --- 2. Sessions ---
 
@@ -280,9 +320,11 @@ class TargetAPIClient:
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         data = await self._request("GET", "/sessions", mutating=False)
-        if not isinstance(data, list):
-            return []
-        return data
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            return [dict(s) for s in data["sessions"] if isinstance(s, dict)]
+        if isinstance(data, list):
+            return data
+        return []
 
     async def get_session_events(self, session_id: str) -> list[dict[str, Any]]:
         data = await self._request("GET", f"/sessions/{session_id}/events", mutating=False)
@@ -392,17 +434,38 @@ class TargetAPIClient:
             existing = self.store.get_asset_by_sha256(digest)
             if existing is not None:
                 self._uploaded_assets_by_sha[digest] = existing
+                if self.asset_cache is not None:
+                    self.asset_cache.put(existing)
                 return existing
-            if self.store.remaining_asset_budget() <= 0:
-                raise AssetLimitError(
-                    f"Asset cap reached ({self.store.max_assets} stored assets)"
-                )
         else:
             cached = self._uploaded_assets_by_sha.get(digest)
             if cached is not None:
                 return cached
-            if len(self._uploaded_assets_by_sha) >= self.max_assets:
-                raise AssetLimitError(f"Asset cap reached ({self.max_assets} stored assets)")
+
+        if self.asset_cache is not None:
+            team_cached = self.asset_cache.get(digest)
+            if team_cached is not None:
+                self._uploaded_assets_by_sha[digest] = team_cached
+                if self.store is not None:
+                    try:
+                        self.store.record_asset(
+                            asset_id=team_cached.asset_id,
+                            local_path=local_path_str or team_cached.local_path,
+                            sha256=digest,
+                            content_type=team_cached.content_type or guessed_type,
+                            size_bytes=team_cached.size_bytes or len(raw),
+                        )
+                    except AssetCapError:
+                        pass
+                return team_cached
+
+        if self.store is not None:
+            if self.store.remaining_asset_budget() <= 0:
+                raise AssetLimitError(
+                    f"Asset cap reached ({self.store.max_assets} stored assets)"
+                )
+        elif len(self._uploaded_assets_by_sha) >= self.max_assets:
+            raise AssetLimitError(f"Asset cap reached ({self.max_assets} stored assets)")
 
         res = await self._request(
             "POST",
@@ -437,6 +500,8 @@ class TargetAPIClient:
             )
 
         self._uploaded_assets_by_sha[digest] = record
+        if self.asset_cache is not None:
+            self.asset_cache.put(record)
         return record
 
     # --- 5. Landing Pages ---
@@ -447,16 +512,25 @@ class TargetAPIClient:
         *,
         url: str,
         title: str,
-        html: str,
+        html: str | None = None,
+        text: str | None = None,
+        images: list[str] | None = None,
         fields: list[str],
+        force: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        del force
+        payload: dict[str, Any] = {
             "url": url,
             "title": title,
-            "html": html,
             "fields": fields,
         }
+        if html is not None:
+            payload["html"] = html
+        if text is not None:
+            payload["text"] = text
+        if images:
+            payload["images"] = list(images)
         res = await self._request(
             "POST",
             f"/sessions/{session_id}/pages",

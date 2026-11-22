@@ -40,6 +40,8 @@ HarvestType = Literal[
     "document_vault",
     "invoice_update",
     "scheduling",
+    "disclosure_intake",
+    "event_overview",
 ]
 
 MAX_LANDING_PAGE_FIELDS = 20  # must match Target API / qa.MAX_PAGE_FIELDS
@@ -152,6 +154,30 @@ TEMPLATE_COPY: dict[HarvestType, _TemplateCopy] = {
         expiry="The agenda is locked at 17:00 today.",
         default_fields=("email", "preferred_slot"),
     ),
+    "disclosure_intake": _TemplateCopy(
+        title=f"Partner Technical Onboarding - {_COMPANY}",
+        heading="Partner technical intake",
+        subheading=(
+            f"Share a quick overview of your current environment so the {_COMPANY} "
+            "integration desk can tailor the technical briefing before we meet."
+        ),
+        notice="Responses go directly to the assigned partner architect for pre-call scoping.",
+        cta="Submit technical notes",
+        expiry="Pre-call intake closes 24 hours before the scheduled briefing.",
+        default_fields=("email", "current_stack", "deployment_notes"),
+    ),
+    "event_overview": _TemplateCopy(
+        title=f"Executive Roundtable Brief - {_COMPANY}",
+        heading="Roundtable registration & focus",
+        subheading=(
+            f"Confirm your contact details and preferred discussion themes for the "
+            f"upcoming {_COMPANY} executive session."
+        ),
+        notice="Seating is limited to 14 leaders; materials are sent immediately after registration.",
+        cta="Confirm registration",
+        expiry="Registration closes at 17:00 before the session brief is distributed.",
+        default_fields=("email", "role", "topic_interest"),
+    ),
 }
 
 # --- Harvest-type selection from a LandingPageSpec ---
@@ -160,6 +186,20 @@ _HARVEST_FIELD_SIGNATURES: tuple[tuple[HarvestType, frozenset[str]], ...] = (
     ("mfa_reauth", frozenset({"one_time_code", "otp", "auth_code", "verification_code"})),
     ("invoice_update", frozenset({"billing_reference", "card_last4", "card_number"})),
     ("document_vault", frozenset({"passcode", "vault_code"})),
+    (
+        "disclosure_intake",
+        frozenset(
+            {
+                "current_stack",
+                "internal_tools",
+                "deployment_notes",
+                "architecture_notes",
+                "vendor_list",
+                "priorities",
+            }
+        ),
+    ),
+    ("event_overview", frozenset({"topic_interest", "attendance_mode", "role_focus"})),
     ("scheduling", frozenset({"preferred_slot", "time_slot"})),
 )
 
@@ -172,6 +212,10 @@ _HARVEST_PRETEXT_KEYWORDS: tuple[tuple[HarvestType, tuple[str, ...]], ...] = (
     ("invoice_update", (
         "invoice", "billing", "payment", "finance", "vendor", "accounting",
     )),
+    ("disclosure_intake", (
+        "intake", "onboarding", "questionnaire", "survey", "scoping", "architecture", "stack",
+    )),
+    ("event_overview", ("overview", "roundtable", "registration", "briefing", "summit")),
     ("scheduling", (
         "schedule", "scheduling", "panel", "conference", "speaker", "workshop",
         "slot", "agenda", "meeting", "event",
@@ -215,6 +259,12 @@ _FIELD_LABELS: dict[str, str] = {
     "billing_reference": "Billing reference",
     "card_last4": "Card number (last 4 digits)",
     "preferred_slot": "Preferred time slot",
+    "current_stack": "Current infrastructure & identity stack",
+    "deployment_notes": "Upcoming deployment notes & priorities",
+    "internal_tools": "Internal tooling in scope",
+    "architecture_notes": "Architecture notes",
+    "topic_interest": "Primary topic of interest",
+    "role": "Role / title",
 }
 
 _TEXT_INPUT_FIELDS = frozenset(

@@ -11,15 +11,17 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 from src.agents.base import BaseAgent
-from src.agents.identity import _linkify_html_fragment, wrap_branded_email_html
+from src.agents.identity import _linkify_html_fragment, wrap_email_html
 from src.agents.qa import check_disallowed_meta_text, check_placeholders
 from src.llm.text import TextLLMClient
 from src.models import (
     BrandingManifest,
     Channel,
+    EmailStyle,
     Proposal,
     QAVerdict,
     Snapshot,
+    SystemSenderAlias,
     TouchSpec,
 )
 
@@ -36,6 +38,10 @@ LIVE_CHANNELS: frozenset[str] = frozenset({"phone_call", "video_call", "teams_ca
 PHONE_CHANNELS: frozenset[str] = frozenset(
     {"sms", "whatsapp", "signal", "imessage", "phone_call", "voicemail"}
 )
+LINKEDIN_CHANNELS: frozenset[str] = frozenset(
+    {"linkedin_message", "linkedin_connection_request"}
+)
+SOCIAL_HANDLE_CHANNELS: frozenset[str] = frozenset({"x_dm", "instagram_dm", "telegram"})
 CHAT_AND_LIVE_CHANNELS: frozenset[str] = frozenset(
     {
         "sms",
@@ -142,6 +148,7 @@ class MessageDraft(BaseModel):
     facts_used: list[str] = Field(default_factory=list)
     from_sender: SenderAddress | None = None
     sent_at: str | None = None
+    hang_up: bool = False
 
     def to_api_message_payload(self, target_id: str) -> dict[str, Any]:
         """Format this draft for ``POST /v1/sessions/{sid}/messages``."""
@@ -185,6 +192,7 @@ class ConversationTurnDraft(BaseModel):
     facts_used: list[str] = Field(default_factory=list)
     from_sender: SenderAddress | None = None
     sent_at: str | None = None
+    hang_up: bool = False
 
     def to_api_payload(self) -> dict[str, Any]:
         """Return exact JSON body for ``POST /v1/conversations/{cid}/turns``."""
@@ -262,14 +270,91 @@ def _trim_at_word_boundary(text: str, limit: int) -> str:
     return f"{truncated}."
 
 
+def _derive_social_handle(sender_name: str, fallback: str = "") -> str:
+    tokens = re.findall(r"[a-z0-9]+", sender_name.lower())
+    if tokens:
+        return "@" + "_".join(tokens[:2])
+    return fallback
+
+
+def _find_system_sender(
+    manifest: BrandingManifest,
+    alias: str | None,
+    *,
+    fallback_keywords: tuple[str, ...] = (),
+) -> SystemSenderAlias | None:
+    if not manifest.system_senders:
+        return None
+    if alias:
+        needle = alias.strip().lower()
+        for item in manifest.system_senders:
+            if item.alias.strip().lower() == needle:
+                return item
+    if fallback_keywords:
+        for item in manifest.system_senders:
+            low = item.alias.strip().lower()
+            if any(kw in low for kw in fallback_keywords):
+                return item
+    return None
+
+
 def resolve_sender_for_channel(
     manifest: BrandingManifest | None,
     channel: Channel,
+    *,
+    sender_alias: str | None = None,
 ) -> SenderAddress | None:
-    """Resolve the Target API ``from`` object from ``BrandingManifest`` for a given channel."""
+    """Resolve the Target API ``from`` object across all 22 channels from ``BrandingManifest``."""
     if manifest is None:
         return None
-    address = manifest.phone if channel in PHONE_CHANNELS and manifest.phone else manifest.email
+
+    alias_entry = _find_system_sender(manifest, sender_alias)
+    if alias_entry is not None:
+        name = alias_entry.display_name.strip() or manifest.sender_name or manifest.company
+        if channel in PHONE_CHANNELS:
+            address = alias_entry.phone.strip() or manifest.phone or alias_entry.email.strip() or manifest.email
+        else:
+            address = alias_entry.email.strip() or manifest.email
+        if name or address:
+            return SenderAddress(name=name, address=address)
+
+    if channel == "mfa_push":
+        sys_mfa = _find_system_sender(
+            manifest,
+            None,
+            fallback_keywords=("mfa", "security", "sso", "auth", "it", "noreply"),
+        )
+        if sys_mfa is not None:
+            name = sys_mfa.display_name.strip() or f"{manifest.company or manifest.sender_name} Security"
+            address = sys_mfa.email.strip() or (f"security@{manifest.domain}" if manifest.domain else manifest.email)
+            return SenderAddress(name=name, address=address)
+        org_label = manifest.company.strip() or manifest.sender_name.strip() or "IT"
+        address = f"security@{manifest.domain.strip()}" if manifest.domain.strip() else manifest.email
+        return SenderAddress(name=f"{org_label} Security", address=address)
+
+    if channel in LINKEDIN_CHANNELS:
+        headline_parts = [p for p in (manifest.title.strip(), manifest.company.strip()) if p]
+        headline = " at ".join(headline_parts) if len(headline_parts) == 2 else "".join(headline_parts)
+        display = f"{manifest.sender_name.strip()} — {headline}" if (manifest.sender_name.strip() and headline) else manifest.sender_name.strip()
+        if not display and not manifest.email:
+            return None
+        return SenderAddress(name=display, address=manifest.email)
+
+    if channel in SOCIAL_HANDLE_CHANNELS:
+        handle = _derive_social_handle(manifest.sender_name, fallback=manifest.email)
+        if not manifest.sender_name and not handle:
+            return None
+        return SenderAddress(name=manifest.sender_name, address=handle)
+
+    if channel in PHONE_CHANNELS:
+        address = manifest.phone if manifest.phone else manifest.email
+        if not manifest.sender_name and not address:
+            return None
+        return SenderAddress(name=manifest.sender_name, address=address)
+
+    # email, calendar_invite, shared_document, slack, teams_chat, teams_call,
+    # video_call, discord, facebook_messenger, live_chat
+    address = manifest.email
     if not manifest.sender_name and not address:
         return None
     return SenderAddress(name=manifest.sender_name, address=address)
@@ -519,12 +604,31 @@ class MessagingAgent(BaseAgent):
         qa_feedback: QAVerdict | None = None,
         rejection_feedback: str | None = None,
         sent_at: str | None = None,
+        current_story_time: str | None = None,
+        channel_info: dict[str, Any] | None = None,
+        email_style: EmailStyle | None = None,
+        action_artifact: dict[str, Any] | None = None,
+        objective: str | None = None,
+        sender_alias: str | None = None,
+        live_turn_context: dict[str, Any] | None = None,
         branded_html: bool | None = None,
         portrait_ref: str | None = None,
         auto_rewrite: bool = True,
     ) -> tuple[MessageDraft, Proposal]:
         """Compose a schema-validated outbound message proposal for the next planned touch."""
         active_touch = touch_spec or self._next_planned_touch(snapshot)
+        plan = snapshot.campaign.plan
+        effective_objective = objective or (plan.objective if plan is not None else None)
+        effective_action_artifact = (
+            action_artifact
+            if action_artifact is not None
+            else (plan.action_artifact if plan is not None else None)
+        )
+        effective_alias = sender_alias or (
+            active_touch.sender_alias if active_touch is not None else None
+        )
+        effective_story_time = current_story_time or sent_at
+
         is_first_contact = snapshot.campaign.budget.used == 0 and not snapshot.conversation.turns
         no_attach, no_attach_reason = attachments_disallowed(
             snapshot,
@@ -545,7 +649,7 @@ class MessagingAgent(BaseAgent):
         )
 
         context: dict[str, Any] = {
-            "mode": "compose",
+            "mode": "live_turn" if live_turn_context is not None else "compose",
             "target": snapshot.target.model_dump(mode="json"),
             "manifest": _compact_manifest_for_llm(snapshot.identity),
             "profile": snapshot.profile.model_dump(mode="json"),
@@ -559,7 +663,19 @@ class MessagingAgent(BaseAgent):
             "attachments_disallowed": no_attach,
             "attachments_disallowed_reason": no_attach_reason if no_attach else "",
             "is_first_contact": is_first_contact,
+            "objective": effective_objective,
+            "current_story_time": effective_story_time,
         }
+        if channel_info is not None:
+            context["channel_info"] = channel_info
+        if effective_action_artifact is not None:
+            context["action_artifact"] = effective_action_artifact
+        if email_style is not None:
+            context["email_style"] = email_style
+        if effective_alias is not None:
+            context["sender_alias"] = effective_alias
+        if live_turn_context is not None:
+            context["live_turn"] = live_turn_context
         if latest_signal is not None:
             context["latest_signal"] = (
                 latest_signal.model_dump(mode="json")
@@ -611,6 +727,22 @@ class MessagingAgent(BaseAgent):
 
         if no_attach and draft.attachments:
             draft.attachments = []
+        elif (
+            not no_attach
+            and not draft.attachments
+            and effective_objective == "action"
+            and isinstance(effective_action_artifact, dict)
+            and effective_action_artifact.get("filename")
+            and draft.channel not in {"sms", "mfa_push", "linkedin_connection_request"}
+        ):
+            fname = str(effective_action_artifact["filename"]).strip()
+            escalation_val = active_touch.escalation if active_touch is not None else 1
+            if fname and (escalation_val >= 3 or fname.lower() in draft.body.lower()):
+                att_obj: dict[str, Any] = {"filename": fname}
+                if effective_action_artifact.get("transcript"):
+                    att_obj["transcript"] = str(effective_action_artifact["transcript"])
+                draft.attachments = [att_obj]
+
         draft, limit_warnings = enforce_channel_limits(draft)
         if snapshot.identity is not None and snapshot.identity.sender_name:
             draft.body = re.sub(
@@ -634,21 +766,38 @@ class MessagingAgent(BaseAgent):
             draft.page_request = None
 
         if draft.from_sender is None:
-            draft.from_sender = resolve_sender_for_channel(snapshot.identity, draft.channel)
+            draft.from_sender = resolve_sender_for_channel(
+                snapshot.identity,
+                draft.channel,
+                sender_alias=effective_alias,
+            )
         if sent_at is not None:
             draft.sent_at = sent_at
 
-        should_wrap_html = (
-            branded_html
-            if branded_html is not None
-            else (
-                draft.channel == "email"
-                and snapshot.identity is not None
-                and bool(snapshot.identity.logo_svg or snapshot.identity.palette)
-            )
+        chosen_email_style: EmailStyle | None = email_style or (
+            active_touch.email_style if active_touch is not None else None
         )
+        if chosen_email_style is None and draft.channel == "email" and snapshot.identity is not None:
+            if branded_html is True:
+                chosen_email_style = "branded_card"
+            elif branded_html is False:
+                chosen_email_style = None
+            else:
+                subj_lower = (draft.subject or "").strip().lower()
+                is_reply_note = subj_lower.startswith("re:") or (
+                    not is_first_contact
+                    and effective_alias is None
+                    and registered_page_url is None
+                )
+                if is_reply_note:
+                    chosen_email_style = "personal_html"
+                elif snapshot.identity.logo_svg or snapshot.identity.palette:
+                    chosen_email_style = "branded_card"
+                else:
+                    chosen_email_style = "personal_html"
+
         if (
-            should_wrap_html
+            chosen_email_style is not None
             and draft.channel == "email"
             and snapshot.identity is not None
             and "<!doctype html>" not in draft.body.lower()
@@ -656,10 +805,11 @@ class MessagingAgent(BaseAgent):
             effective_portrait = portrait_ref
             if effective_portrait is None and snapshot.identity.portrait.api_asset_id:
                 effective_portrait = f"asset://{snapshot.identity.portrait.api_asset_id}"
-            draft.body = wrap_branded_email_html(
+            draft.body = wrap_email_html(
                 snapshot.identity,
                 subject=draft.subject or "",
                 body_html=draft.body,
+                style=chosen_email_style,
                 portrait_ref=effective_portrait,
             )
 
@@ -674,6 +824,8 @@ class MessagingAgent(BaseAgent):
 
         warnings = [*limit_warnings, *fact_warnings, *lint_issues]
         payload = draft.model_dump(mode="json")
+        if chosen_email_style is not None:
+            payload["email_style"] = chosen_email_style
         if warnings:
             payload["warnings"] = warnings
         if snapshot.target.id:
@@ -698,6 +850,12 @@ class MessagingAgent(BaseAgent):
         channel: Channel = "phone_call",
         touch_spec: TouchSpec | None = None,
         latest_signal: SignalAssessment | dict[str, Any] | None = None,
+        persona_says: str | None = None,
+        turn_index: int = 1,
+        current_story_time: str | None = None,
+        registered_page_url: str | None = None,
+        channel_info: dict[str, Any] | None = None,
+        sender_alias: str | None = None,
         sent_at: str | None = None,
         auto_rewrite: bool = True,
     ) -> tuple[ConversationTurnDraft, Proposal]:
@@ -717,32 +875,55 @@ class MessagingAgent(BaseAgent):
         if effective_touch.channel not in LIVE_CHANNELS:
             effective_touch = effective_touch.model_copy(update={"channel": channel})
 
+        live_turn_ctx: dict[str, Any] = {
+            "turn_index": turn_index,
+            "max_turns": MAX_CONVERSATION_TURNS,
+            "persona_says": persona_says or "",
+            "instructions": (
+                "Speak naturally in 1-2 short spoken sentences. Set hang_up=true only if "
+                "the conversation reached a natural goodbye or clear refusal."
+            ),
+        }
         draft, base_proposal = await self.compose(
             snapshot,
             touch_spec=effective_touch,
             latest_signal=latest_signal,
+            registered_page_url=registered_page_url,
             sent_at=sent_at,
+            current_story_time=current_story_time or sent_at,
+            channel_info=channel_info,
+            sender_alias=sender_alias,
+            live_turn_context=live_turn_ctx,
             branded_html=False,
             auto_rewrite=auto_rewrite,
         )
         turn_text = _trim_at_word_boundary(draft.body.strip(), LIVE_TURN_MAX_CHARS)
+        effective_alias = sender_alias or effective_touch.sender_alias
         turn = ConversationTurnDraft(
             channel=channel,
             say=turn_text,
             attachments=list(draft.attachments[:MAX_TURN_ATTACHMENTS]),
             facts_used=draft.facts_used,
-            from_sender=draft.from_sender or resolve_sender_for_channel(snapshot.identity, channel),
+            from_sender=draft.from_sender
+            or resolve_sender_for_channel(
+                snapshot.identity, channel, sender_alias=effective_alias
+            ),
             sent_at=draft.sent_at,
+            hang_up=bool(draft.hang_up),
         )
 
         payload = dict(base_proposal.payload)
         payload["say"] = turn.say
+        payload["hang_up"] = turn.hang_up
         payload["api_payload"] = turn.to_api_payload()
         proposal = self.make_proposal(
             snapshot,
             payload,
             kind="message",
-            rationale=f"Composed live {channel} turn ({len(turn.say)} chars).",
+            rationale=(
+                f"Composed live {channel} turn {turn_index}/{MAX_CONVERSATION_TURNS} "
+                f"({len(turn.say)} chars, hang_up={turn.hang_up})."
+            ),
         )
         return turn, proposal
 
@@ -829,6 +1010,12 @@ class MessagingAgent(BaseAgent):
                 channel=kwargs.get("channel", "phone_call"),
                 touch_spec=touch_spec,
                 latest_signal=kwargs.get("latest_signal"),
+                persona_says=kwargs.get("persona_says"),
+                turn_index=int(kwargs.get("turn_index", 1)),
+                current_story_time=kwargs.get("current_story_time"),
+                registered_page_url=kwargs.get("registered_page_url"),
+                channel_info=kwargs.get("channel_info"),
+                sender_alias=kwargs.get("sender_alias"),
                 sent_at=kwargs.get("sent_at"),
                 auto_rewrite=bool(kwargs.get("auto_rewrite", True)),
             )
@@ -844,6 +1031,12 @@ class MessagingAgent(BaseAgent):
             qa_feedback=qa_feedback,
             rejection_feedback=kwargs.get("rejection_feedback"),
             sent_at=kwargs.get("sent_at"),
+            current_story_time=kwargs.get("current_story_time"),
+            channel_info=kwargs.get("channel_info"),
+            email_style=kwargs.get("email_style"),
+            action_artifact=kwargs.get("action_artifact"),
+            objective=kwargs.get("objective"),
+            sender_alias=kwargs.get("sender_alias"),
             branded_html=kwargs.get("branded_html"),
             portrait_ref=kwargs.get("portrait_ref"),
             auto_rewrite=bool(kwargs.get("auto_rewrite", True)),

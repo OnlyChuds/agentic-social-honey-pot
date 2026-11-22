@@ -65,6 +65,7 @@ FactStatus = Literal["active", "superseded"]
 HookStatus = Literal["candidate", "active", "exhausted"]
 CampaignState = Literal["BOOT", "RESEARCH", "ENGAGE", "WIN", "ABORT", "DONE"]
 Objective = Literal["credentials", "action", "disclosure", "your_call"]
+EmailStyle = Literal["branded_card", "personal_html", "plain_text"]
 
 Channel = Literal[
     "email",
@@ -191,6 +192,14 @@ class VoiceStyle(BaseModel):
     length: str = "2-4 sentences"
 
 
+class SystemSenderAlias(BaseModel):
+    alias: str
+    display_name: str = ""
+    email: str = ""
+    title: str = ""
+    phone: str = ""
+
+
 class BrandingManifest(BaseModel):
     concept: str = ""
     sender_name: str = ""
@@ -208,6 +217,7 @@ class BrandingManifest(BaseModel):
     signature: str = ""
     footer_legal: str = ""
     voice: VoiceStyle = Field(default_factory=VoiceStyle)
+    system_senders: list[SystemSenderAlias] = Field(default_factory=list)
 
 
 # --- 8.7 Campaign plan ---
@@ -220,6 +230,9 @@ class TouchSpec(BaseModel):
     hook: str = ""
     escalation: int = 1
     stop_if: str = ""
+    email_style: EmailStyle | None = None
+    sender_alias: str | None = None
+    story_delay_minutes: int | None = None
 
 
 class LandingPageSpec(BaseModel):
@@ -239,6 +252,7 @@ class CampaignPlan(BaseModel):
     primary_hook: str = ""
     touches: list[TouchSpec] = Field(default_factory=list)
     landing_page: LandingPageSpec | None = None
+    pages: list[LandingPageSpec] = Field(default_factory=list)
     action_artifact: dict[str, Any] | None = None
     pivot_triggers: list[str] = Field(default_factory=list)
     give_up: str = ""

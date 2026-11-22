@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 import zlib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
 from typing import Any
@@ -12,12 +13,43 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from tests.mock_api.personas import PersonaKind, evaluate_persona_reaction
+from tests.mock_api.personas import (
+    PersonaKind,
+    evaluate_live_turn,
+    evaluate_persona_reaction,
+    mock_live_greeting,
+)
 
 MAX_MOCK_ASSETS = 300
 MAX_MOCK_ASSET_BYTES = 5 * 1024 * 1024
 MAX_MOCK_TURN_CHARS = 4000
+MAX_MOCK_CONVERSATION_TURNS = 10
 ALLOWED_ASSET_TYPES = {"image/png", "image/jpeg", "image/webp", "application/pdf"}
+
+MOCK_CHANNELS: list[dict[str, Any]] = [
+    {"id": "email", "group": "mail", "arrives_as": "External email in inbox", "supports_subject": True, "supports_attachments": True, "is_live": False},
+    {"id": "calendar_invite", "group": "mail", "arrives_as": "Calendar invite", "supports_subject": True, "supports_attachments": True, "is_live": False},
+    {"id": "shared_document", "group": "mail", "arrives_as": "Shared document notification", "supports_subject": True, "supports_attachments": True, "is_live": False},
+    {"id": "voicemail", "group": "mail", "arrives_as": "Voicemail audio transcript", "supports_subject": False, "supports_attachments": True, "is_live": False},
+    {"id": "linkedin_message", "group": "social", "arrives_as": "LinkedIn DM showing sender name and headline", "supports_subject": False, "supports_attachments": False, "is_live": False},
+    {"id": "linkedin_connection_request", "group": "social", "arrives_as": "LinkedIn connection note (<=300 chars)", "supports_subject": False, "supports_attachments": False, "is_live": False},
+    {"id": "sms", "group": "messaging", "arrives_as": "SMS from phone number", "supports_subject": False, "supports_attachments": False, "is_live": False},
+    {"id": "whatsapp", "group": "messaging", "arrives_as": "WhatsApp message from phone number", "supports_subject": False, "supports_attachments": True, "is_live": False},
+    {"id": "slack", "group": "work_chat", "arrives_as": "Slack message", "supports_subject": False, "supports_attachments": True, "is_live": False},
+    {"id": "teams_chat", "group": "work_chat", "arrives_as": "Microsoft Teams chat (marked external)", "supports_subject": False, "supports_attachments": True, "is_live": False},
+    {"id": "mfa_push", "group": "system", "arrives_as": "Authenticator push approval prompt (unless your memory says otherwise)", "supports_subject": False, "supports_attachments": False, "is_live": False},
+    {"id": "phone_call", "group": "live", "arrives_as": "Incoming phone call (1 touch, up to 10 live turns)", "supports_subject": False, "supports_attachments": True, "is_live": True},
+    {"id": "video_call", "group": "live", "arrives_as": "Incoming video call (1 touch, up to 10 live turns)", "supports_subject": False, "supports_attachments": True, "is_live": True},
+    {"id": "teams_call", "group": "live", "arrives_as": "Incoming Teams call (1 touch, up to 10 live turns)", "supports_subject": False, "supports_attachments": True, "is_live": True},
+    {"id": "live_chat", "group": "live", "arrives_as": "Interactive live chat (1 touch, up to 10 live turns)", "supports_subject": False, "supports_attachments": True, "is_live": True},
+]
+
+
+def _parse_iso_ts(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
 class CreateSessionReq(BaseModel):
@@ -30,22 +62,28 @@ class SendMessageReq(BaseModel):
     body: str
     subject: str | None = None
     attachments: list[Any] | None = None
+    sent_at: str | None = None
 
 
 class RegisterPageReq(BaseModel):
     url: str
     title: str
-    html: str
+    html: str | None = None
+    text: str | None = None
+    images: list[str] | None = None
     fields: list[str]
 
 
 class StartConversationReq(BaseModel):
     to: str
     channel: str
+    sent_at: str | None = None
 
 
 class ConversationTurnReq(BaseModel):
     say: str
+    attachments: list[Any] | None = None
+    sent_at: str | None = None
 
 
 @dataclass
@@ -55,6 +93,7 @@ class MockSession:
     touch_budget: int
     touches_used: int = 0
     ended: bool = False
+    story_time: str | None = None
     pages: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -201,10 +240,34 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             code = st.fault_queue.pop(0)
             raise HTTPException(status_code=code, detail=f"Injected mock fault HTTP {code}")
 
+    def _advance_story_time(sess: MockSession, sent_at: str | None) -> None:
+        if not sent_at:
+            return
+        try:
+            incoming = _parse_iso_ts(sent_at)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid sent_at timestamp: {sent_at}") from exc
+        if sess.story_time is not None:
+            current = _parse_iso_ts(sess.story_time)
+            if incoming < current:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"sent_at ({sent_at}) is earlier than current session story_time "
+                        f"({sess.story_time})"
+                    ),
+                )
+        sess.story_time = sent_at
+
     @app.get("/v1/scenarios")
     async def get_scenarios(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
         _check_auth(authorization)
         return st.scenarios()
+
+    @app.get("/v1/channels")
+    async def get_channels(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        _check_auth(authorization)
+        return {"channels": [dict(c) for c in MOCK_CHANNELS]}
 
     @app.post("/v1/sessions")
     async def create_session(
@@ -270,6 +333,7 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             "touch_budget": sess.touch_budget,
             "touches_used": sess.touches_used,
             "ended": sess.ended,
+            "story_time": sess.story_time,
         }
 
     @app.get("/v1/sessions/{sid}/events")
@@ -314,9 +378,17 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             "page_id": page_id,
             "url": req.url,
             "title": req.title,
+            "html": req.html,
+            "text": req.text,
+            "images": list(req.images or []),
             "fields": list(req.fields),
         }
-        sess.pages.append(page_rec)
+        # Support in-place overwrite when the URL already exists in this session
+        existing_idx = next((i for i, p in enumerate(sess.pages) if p.get("url") == req.url), None)
+        if existing_idx is not None:
+            sess.pages[existing_idx] = page_rec
+        else:
+            sess.pages.append(page_rec)
         if idempotency_key:
             st.idempotency_cache[idempotency_key] = page_rec
         return page_rec
@@ -342,6 +414,8 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             raise HTTPException(status_code=409, detail="Session already ended")
         if sess.touches_used >= sess.touch_budget:
             raise HTTPException(status_code=409, detail="Touch budget exhausted")
+        # Validate story_time BEFORE charging a touch
+        _advance_story_time(sess, req.sent_at)
 
         sess.touches_used += 1
         sess.messages.append(req.model_dump())
@@ -449,6 +523,7 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             return st.idempotency_cache[idempotency_key]
         if sess.ended or sess.touches_used >= sess.touch_budget:
             raise HTTPException(status_code=409, detail="Touch budget exhausted or session ended")
+        _advance_story_time(sess, req.sent_at)
 
         sess.touches_used += 1
         cid = f"cid_{uuid4().hex[:8]}"
@@ -458,7 +533,15 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
             to=req.to,
             channel=req.channel,
         )
-        out = {"conversation_id": cid, "touches_used": sess.touches_used}
+        persona = st.persona_by_target.get(req.to, st.default_persona)
+        out = {
+            "conversation_id": cid,
+            "touches_used": sess.touches_used,
+            "persona_says": mock_live_greeting(persona, req.channel),
+            "ended": False,
+            "turns_used": 0,
+            "events": [],
+        }
         if idempotency_key:
             st.idempotency_cache[idempotency_key] = out
         return out
@@ -473,24 +556,35 @@ def create_mock_app(state: MockTargetState | None = None) -> tuple[FastAPI, Mock
         conv = st.conversations.get(cid)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        if conv.ended:
-            raise HTTPException(status_code=409, detail="Conversation already ended")
+        if conv.ended or len(conv.turns) >= MAX_MOCK_CONVERSATION_TURNS:
+            conv.ended = True
+            raise HTTPException(status_code=409, detail="Conversation already ended (turn limit)")
         if len(req.say) > MAX_MOCK_TURN_CHARS:
             raise HTTPException(status_code=413, detail="Turn text exceeds 4000 chars")
 
-        conv.turns.append(req.say)
         sess = st.sessions[conv.session_id]
+        _advance_story_time(sess, req.sent_at)
+        conv.turns.append(req.say)
         persona = st.persona_by_target.get(conv.to, st.default_persona)
-        events = evaluate_persona_reaction(
+        persona_says, ended, events = evaluate_live_turn(
             persona=persona,
             channel=conv.channel,
-            body=req.say,
-            touch_number=len(conv.turns),
+            say=req.say,
+            turn_number=len(conv.turns),
             registered_pages=sess.pages,
-            attachments=[],
+            attachments=req.attachments or [],
         )
+        if len(conv.turns) >= MAX_MOCK_CONVERSATION_TURNS:
+            ended = True
+        conv.ended = ended
         sess.events.extend(events)
-        return {"conversation_id": cid, "events": events}
+        return {
+            "conversation_id": cid,
+            "persona_says": persona_says,
+            "ended": ended,
+            "turns_used": len(conv.turns),
+            "events": events,
+        }
 
     @app.post("/v1/conversations/{cid}/end")
     async def end_conversation(

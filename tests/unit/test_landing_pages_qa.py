@@ -52,7 +52,7 @@ def test_page_artifact_spec_shared_and_harvest_types_complete() -> None:
     assert IdentityPageArtifactSpec is PageArtifactSpec
     harvest_types = set(get_args(HarvestType))
     assert harvest_types == set(TEMPLATE_COPY.keys())
-    assert len(harvest_types) == 6
+    assert len(harvest_types) == 8
 
 
 @pytest.mark.parametrize(
@@ -119,6 +119,20 @@ async def test_all_templates_pass_playwright_and_qa_gate() -> None:
             ),
         ),
         ("scheduling", LandingPageSpec(pretext="Confirm panel slot", fields=["email", "preferred_slot"])),
+        (
+            "disclosure_intake",
+            LandingPageSpec(
+                pretext="Partner technical onboarding questionnaire",
+                fields=["email", "architecture_notes", "internal_contact"],
+            ),
+        ),
+        (
+            "event_overview",
+            LandingPageSpec(
+                pretext="Executive summit overview and RSVP",
+                fields=["full_name", "email", "company"],
+            ),
+        ),
     ]
 
     try:

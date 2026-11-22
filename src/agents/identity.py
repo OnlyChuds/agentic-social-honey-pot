@@ -35,6 +35,7 @@ from src.models import (
 logger = logging.getLogger(__name__)
 
 IdentityMode = Literal["bootstrap", "update", "landing_page", "revise"]
+EmailStyle = Literal["branded_card", "personal_html", "plain_text"]
 
 _SAFE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -187,14 +188,29 @@ def _strip_duplicate_trailing_signature(body: str, manifest: BrandingManifest) -
     return body
 
 
-def wrap_branded_email_html(
+def _html_to_plain_text(raw: str) -> str:
+    """Convert light HTML body markup into clean plain text while preserving paragraphs."""
+    if "<" not in raw:
+        return raw.strip()
+    text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    text = re.sub(r"</(?:p|div|li|tr|h[1-6])>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
+    text = _INLINE_TAG_RE.sub("", text)
+    text = html_lib.unescape(text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    collapsed = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    return collapsed.strip()
+
+
+def wrap_email_html(
     manifest: BrandingManifest,
     *,
     subject: str,
     body_html: str,
+    style: EmailStyle = "personal_html",
     portrait_ref: str | None = None,
 ) -> str:
-    """Assemble a self-contained, offline-renderable HTML email using manifest branding."""
+    """Format an email body in ``branded_card``, ``personal_html``, or ``plain_text`` style."""
     primary = _safe_hex_color(manifest.palette[0], "#1f2937") if manifest.palette else "#1f2937"
     accent = (
         _safe_hex_color(manifest.palette[1], "#2563eb")
@@ -209,9 +225,61 @@ def wrap_branded_email_html(
     safe_title = html_lib.escape(manifest.title)
     safe_email = html_lib.escape(manifest.email)
     safe_footer = html_lib.escape(manifest.footer_legal)
-    safe_signature_html = "<br>".join(
-        html_lib.escape(line) for line in manifest.signature.splitlines() if line.strip()
-    )
+    sig_lines = [line.strip() for line in manifest.signature.splitlines() if line.strip()]
+    safe_signature_html = "<br>".join(html_lib.escape(line) for line in sig_lines)
+
+    body_content = _strip_duplicate_trailing_signature(body_html.strip(), manifest)
+
+    if style == "plain_text":
+        plain_body = _html_to_plain_text(body_content)
+        plain_sig = "\n".join(sig_lines) if sig_lines else "\n".join(
+            part
+            for part in (manifest.sender_name, manifest.title, manifest.company, manifest.email)
+            if part.strip()
+        )
+        if plain_sig:
+            return f"{plain_body}\n\n--\n{plain_sig}".strip()
+        return plain_body
+
+    if "<" not in body_content:
+        paragraphs = [p.strip() for p in body_content.split("\n\n") if p.strip()]
+        body_content = "".join(
+            f'<p style="margin:0 0 14px 0;line-height:1.55;">'
+            f"{_linkify_plain_text_escaped(html_lib.escape(p), accent).replace(chr(10), '<br>')}</p>"
+            for p in paragraphs
+        )
+    else:
+        body_content = _linkify_html_fragment(body_content, accent)
+
+    if style == "personal_html":
+        sig_inner = safe_signature_html or (
+            f"{safe_sender}"
+            + (f"<br>{safe_title}" if safe_title else "")
+            + (f"<br>{safe_company}" if manifest.company else "")
+        )
+        sig_block = (
+            f'<div style="margin-top:18px;font-size:13px;line-height:1.5;color:#4b5563;">'
+            f"{sig_inner}</div>"
+            if sig_inner
+            else ""
+        )
+        return (
+            "<!doctype html>"
+            '<html lang="en">'
+            "<head>"
+            '<meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"<title>{safe_subject}</title>"
+            "</head>"
+            f'<body style="margin:0;padding:18px 20px;background:#ffffff;'
+            f'font-family:{font_stack};font-size:14px;line-height:1.55;color:#111827;">'
+            '<div style="max-width:640px;">'
+            f"{body_content}"
+            f"{sig_block}"
+            "</div>"
+            "</body>"
+            "</html>"
+        )
 
     logo_block = (
         manifest.logo_svg.strip()
@@ -228,17 +296,6 @@ def wrap_branded_email_html(
             f'object-position:center 20%;display:block;">'
             f"</td>"
         )
-
-    body_content = _strip_duplicate_trailing_signature(body_html.strip(), manifest)
-    if "<" not in body_content:
-        paragraphs = [p.strip() for p in body_content.split("\n\n") if p.strip()]
-        body_content = "".join(
-            f'<p style="margin:0 0 14px 0;line-height:1.55;">'
-            f"{_linkify_plain_text_escaped(html_lib.escape(p), accent).replace(chr(10), '<br>')}</p>"
-            for p in paragraphs
-        )
-    else:
-        body_content = _linkify_html_fragment(body_content, accent)
 
     signature_section = ""
     if safe_signature_html or safe_sender:
@@ -294,6 +351,23 @@ def wrap_branded_email_html(
         "</div>"
         "</body>"
         "</html>"
+    )
+
+
+def wrap_branded_email_html(
+    manifest: BrandingManifest,
+    *,
+    subject: str,
+    body_html: str,
+    portrait_ref: str | None = None,
+) -> str:
+    """Assemble a self-contained, offline-renderable branded HTML email."""
+    return wrap_email_html(
+        manifest,
+        subject=subject,
+        body_html=body_html,
+        style="branded_card",
+        portrait_ref=portrait_ref,
     )
 
 
