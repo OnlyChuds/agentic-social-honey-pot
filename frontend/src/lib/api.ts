@@ -1,4 +1,8 @@
 import type {
+  EvalScenariosResponse,
+  EvalStatusResponse,
+  LaunchEvalRequest,
+  LaunchEvalResponse,
   LaunchRunRequest,
   LaunchRunResponse,
   SnapshotJSON,
@@ -61,4 +65,20 @@ export function stopPracticeRun(runId: string): Promise<{ run_id: string; stoppe
     `/api/runs/${encodeURIComponent(runId)}/stop`,
     { method: "POST" }
   );
+}
+
+export function fetchEvalStatus(): Promise<EvalStatusResponse> {
+  return fetchJson<EvalStatusResponse>("/api/eval/status");
+}
+
+export function fetchEvalScenarios(): Promise<EvalScenariosResponse> {
+  return fetchJson<EvalScenariosResponse>("/api/eval/scenarios");
+}
+
+export function launchEvalRuns(req: LaunchEvalRequest): Promise<LaunchEvalResponse> {
+  return fetchJson<LaunchEvalResponse>("/api/eval/launch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
 }

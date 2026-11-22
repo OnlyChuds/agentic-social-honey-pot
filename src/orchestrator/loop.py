@@ -96,6 +96,7 @@ class Orchestrator:
         memory_store: TargetMemoryStore | None = None,
         story_clock: StoryClock | None = None,
         renderer: Any | None = None,
+        max_sessions_override: int | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -106,6 +107,7 @@ class Orchestrator:
         self.memory_store = memory_store or TargetMemoryStore(state.store.db_path.parent)
         self.story_clock = story_clock or StoryClock()
         self._renderer = renderer
+        self.max_sessions_override = max_sessions_override
 
         min_gap = (
             config.aggressive.pacing.min_gap_s
@@ -352,6 +354,8 @@ class Orchestrator:
         if self.aggressive:
             default_touches = min(default_touches, self.config.aggressive.budget.compressed_plan_touches)
         default_sessions = 3 if scenario_id == "eval" else 60
+        if self.max_sessions_override is not None:
+            default_sessions = min(default_sessions, max(1, self.max_sessions_override))
         target = TargetInfo(id=target_id, name=target_id)
 
         try:
@@ -369,6 +373,8 @@ class Orchestrator:
                 touch_budget = min(touch_budget, self.config.aggressive.budget.compressed_plan_touches)
             raw_max_sessions = sc.get("max_sessions")
             max_sessions = int(raw_max_sessions) if raw_max_sessions is not None else default_sessions
+            if self.max_sessions_override is not None:
+                max_sessions = min(max_sessions, max(1, self.max_sessions_override))
             company = str(sc.get("company") or "")
             targets_list = [t for t in sc.get("targets", []) if isinstance(t, dict)]
             matched_target = next((t for t in targets_list if t.get("id") == target_id), None)

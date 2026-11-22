@@ -540,6 +540,7 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
                 policy=policy,
                 aggressive=args.aggressive,
                 renderer=renderer,
+                max_sessions_override=getattr(args, "max_sessions", None),
             )
             current_task = asyncio.current_task()
             loop = asyncio.get_running_loop()
@@ -581,6 +582,12 @@ def main() -> None:
     parser.add_argument("--aggressive", action="store_true", help="Use aggressive eval pacing/budget")
     parser.add_argument("--resume", action="store_true", help="Recover and resume from SQLite DB")
     parser.add_argument("--max-cycles", type=int, default=50)
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=None,
+        help="Cap sessions allowed for this run (e.g. 1 per eval target)",
+    )
     parser.add_argument("--zero-pacing", action="store_true", help="Disable wait between touches")
     parser.add_argument(
         "--dry-run-stub-agents",

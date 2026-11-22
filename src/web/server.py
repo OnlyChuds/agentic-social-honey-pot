@@ -11,12 +11,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
+from src.config import load_config
 from src.models import utc_now_iso
 from src.web.demo_seed import seed_demo_data
 from src.web.offline_replay import write_acknowledgment_replay
@@ -36,10 +38,92 @@ class LaunchRunRequest(BaseModel):
     scenario: str = "practice"
 
 
+class LaunchEvalRequest(BaseModel):
+    target_ids: list[str] = Field(default_factory=list)
+    run_all: bool = False
+    zero_pacing: bool = True
+    aggressive: bool = True
+    confirm: bool = False
+
+
 class OfflineReplayRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     fixture: Literal["acknowledgment"]
+
+
+async def _fetch_eval_scenario_metadata() -> dict[str, Any]:
+    """Read-only GET /v1/scenarios lookup for the eval scenario (0 sessions/touches spent)."""
+    cfg = load_config("config.yaml")
+    base_url = cfg.target_api.base_url.rstrip("/")
+    team_key = cfg.target_api.team_key
+    if not base_url or not team_key:
+        raise HTTPException(
+            status_code=500,
+            detail="TARGET_API_URL or TEAM_API_KEY is not configured.",
+        )
+    url = f"{base_url}/scenarios"
+    headers = {"Authorization": f"Bearer {team_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach Target API /v1/scenarios: {exc}",
+        ) from exc
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502 if resp.status_code >= 500 else resp.status_code,
+            detail=f"Target API /v1/scenarios returned HTTP {resp.status_code}: {resp.text[:240]}",
+        )
+
+    raw = resp.json()
+    scenarios = raw.get("scenarios", []) if isinstance(raw, dict) else raw
+    if not isinstance(scenarios, list):
+        raise HTTPException(status_code=502, detail="Unexpected /v1/scenarios response shape.")
+
+    eval_sc = next(
+        (
+            sc
+            for sc in scenarios
+            if isinstance(sc, dict) and (sc.get("id") == "eval" or sc.get("kind") == "eval")
+        ),
+        None,
+    )
+    if eval_sc is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No 'eval' scenario returned by Target API /v1/scenarios.",
+        )
+
+    targets = [
+        {
+            "id": str(t.get("id") or ""),
+            "name": str(t.get("name") or t.get("id") or ""),
+            "role": str(t.get("role") or ""),
+        }
+        for t in eval_sc.get("targets", [])
+        if isinstance(t, dict) and t.get("id")
+    ]
+    objectives = [
+        {
+            "id": str(o.get("id") or ""),
+            "text": str(o.get("text") or ""),
+        }
+        for o in eval_sc.get("objectives", [])
+        if isinstance(o, dict)
+    ]
+    return {
+        "id": str(eval_sc.get("id") or "eval"),
+        "open": bool(eval_sc.get("open", True)),
+        "company": str(eval_sc.get("company") or ""),
+        "touch_budget": int(eval_sc.get("touch_budget") or 10),
+        "max_sessions": int(eval_sc.get("max_sessions") or 15),
+        "targets": targets,
+        "objectives": objectives,
+    }
 
 
 def _resolve_db_path(data_dir: Path, run_id: str) -> Path:
@@ -233,6 +317,83 @@ def create_app(
         detail_cache.pop(run_id, None)
         return {"run_id": run_id, "stopped": stopped}
 
+    async def api_eval_status() -> dict[str, Any]:
+        return manager.eval_status(resolved_dir)
+
+    async def api_eval_scenarios() -> dict[str, Any]:
+        meta = await _fetch_eval_scenario_metadata()
+        status = manager.eval_status(resolved_dir)
+        return {**meta, **status}
+
+    async def api_launch_eval(req: LaunchEvalRequest) -> dict[str, Any]:
+        if not req.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Explicit confirmation (confirm=true) is required to launch Eval runs.",
+            )
+
+        requested_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_id in req.target_ids:
+            cleaned = raw_id.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                requested_ids.append(cleaned)
+
+        if not requested_ids and req.run_all:
+            meta = await _fetch_eval_scenario_metadata()
+            if not meta.get("open", True):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Eval scenario is not currently open.",
+                )
+            st = manager.eval_status(resolved_dir)
+            target_counts = st.get("target_counts", {})
+            max_per_target = int(st.get("max_per_target", 5))
+            requested_ids = [
+                str(t["id"])
+                for t in meta.get("targets", [])
+                if t.get("id") and int(target_counts.get(str(t["id"]), 0)) < max_per_target
+            ]
+
+        if not requested_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="No eligible eval targets selected (or all eval targets already ran).",
+            )
+
+        status_before = manager.eval_status(resolved_dir)
+        if len(requested_ids) > int(status_before["remaining"]):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Requested {len(requested_ids)} eval target(s), but only "
+                    f"{status_before['remaining']} of {status_before['max_sessions']} tries remain."
+                ),
+            )
+
+        launched: list[dict[str, Any]] = []
+        for tid in requested_ids:
+            try:
+                info = manager.launch_eval(
+                    target_id=tid,
+                    zero_pacing=req.zero_pacing,
+                    aggressive=req.aggressive,
+                    data_dir=resolved_dir,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            launched.append(info.to_dict())
+
+        targets_cache["fp"] = None
+        targets_cache["data"] = None
+        return {
+            "runs": launched,
+            "eval_status": manager.eval_status(resolved_dir),
+        }
+
     def api_create_offline_replay(_request: OfflineReplayRequest) -> dict[str, str]:
         return {"run_id": write_acknowledgment_replay(resolved_dir)}
 
@@ -241,6 +402,9 @@ def create_app(
     else:
         app.post("/api/runs/launch")(api_launch_run)
         app.post("/api/runs/{run_id}/stop")(api_stop_run)
+        app.get("/api/eval/status")(api_eval_status)
+        app.get("/api/eval/scenarios")(api_eval_scenarios)
+        app.post("/api/eval/launch")(api_launch_eval)
 
     @app.get("/api/runs/active")
     async def api_active_runs() -> dict[str, Any]:

@@ -74,7 +74,7 @@ export function LaunchPracticeDialog({ onLaunched }: LaunchPracticeDialogProps) 
         <DialogHeader>
           <DialogTitle>New Practice Campaign</DialogTitle>
           <DialogDescription>
-            Starts a sandboxed practice run. Evaluation runs remain CLI-only.
+            Starts a sandboxed practice run (unlimited sessions, unscored).
           </DialogDescription>
         </DialogHeader>
 

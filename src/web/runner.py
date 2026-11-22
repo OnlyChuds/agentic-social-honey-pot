@@ -19,6 +19,9 @@ from src.models import Event, utc_now_iso
 from src.store.db import Store
 
 TARGET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+EVAL_DB_RE = re.compile(r"^eval_([A-Za-z0-9_-]+)_run(\d+)\.db$")
+EVAL_MAX_PER_TARGET = 5
+EVAL_MAX_SESSIONS = 15
 VALID_MODES: frozenset[str] = frozenset({"mock_stub", "practice_live"})
 VALID_STUB_OBJECTIVES: frozenset[str] = frozenset({"credentials", "action", "disclosure"})
 MOCK_API_TOKEN = "test-team-key"
@@ -300,6 +303,133 @@ class RunManager:
                 run_no=run_no,
                 mode=mode,
                 stub_objective=stub_objective if mode == "mock_stub" else None,
+                pid=proc.pid,
+                db_path=str(db_path),
+                started_at=utc_now_iso(),
+                status="running",
+                returncode=None,
+            )
+            self._runs[run_id] = _TrackedRun(info=info, process=proc)
+            return info
+
+    def _collect_eval_usage(
+        self, data_dir: Path | None = None
+    ) -> tuple[dict[str, int], dict[str, int], int]:
+        """Inspect local disk + tracked runs for eval usage (zero Target API calls).
+
+        Returns ``(per_target_counts, per_target_max_run_no, total_runs)``.
+        """
+        target_dir = Path(data_dir) if data_dir is not None else self.data_dir
+        runs_by_target: dict[str, set[str]] = {}
+        max_run_no_by_target: dict[str, int] = {}
+        all_run_ids: set[str] = set()
+
+        if target_dir.exists():
+            for entry in sorted(target_dir.glob("eval_*_run*.db")):
+                m = EVAL_DB_RE.match(entry.name)
+                if m:
+                    tid = m.group(1)
+                    rno = int(m.group(2))
+                    runs_by_target.setdefault(tid, set()).add(entry.stem)
+                    max_run_no_by_target[tid] = max(max_run_no_by_target.get(tid, 0), rno)
+                    all_run_ids.add(entry.stem)
+
+        for run_id, tracked in self._runs.items():
+            if tracked.info.scenario == "eval":
+                tid = tracked.info.target_id
+                runs_by_target.setdefault(tid, set()).add(run_id)
+                max_run_no_by_target[tid] = max(
+                    max_run_no_by_target.get(tid, 0), tracked.info.run_no
+                )
+                all_run_ids.add(run_id)
+
+        per_target_counts = {tid: len(rids) for tid, rids in sorted(runs_by_target.items())}
+        return per_target_counts, max_run_no_by_target, len(all_run_ids)
+
+    def eval_status(self, data_dir: Path | None = None) -> dict[str, Any]:
+        """Return local eval try accounting (5 tries per target, 15 sessions total)."""
+        with self._lock:
+            target_counts, _, used_count = self._collect_eval_usage(data_dir)
+            return {
+                "used_targets": sorted(target_counts.keys()),
+                "target_counts": target_counts,
+                "max_per_target": EVAL_MAX_PER_TARGET,
+                "used_count": used_count,
+                "max_sessions": EVAL_MAX_SESSIONS,
+                "remaining": max(0, EVAL_MAX_SESSIONS - used_count),
+            }
+
+    def launch_eval(
+        self,
+        *,
+        target_id: str,
+        zero_pacing: bool = True,
+        aggressive: bool = True,
+        data_dir: Path | None = None,
+    ) -> ActiveRunInfo:
+        """Spawn a single-session eval run (up to 5 tries per target, 15 total)."""
+        if not TARGET_ID_RE.match(target_id):
+            raise ValueError(
+                f"Invalid target_id {target_id!r}; must match ^[A-Za-z0-9_-]{{1,64}}$"
+            )
+
+        target_dir = Path(data_dir) if data_dir is not None else self.data_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            target_counts, max_run_nos, used_count = self._collect_eval_usage(target_dir)
+            target_used = target_counts.get(target_id, 0)
+            if target_used >= EVAL_MAX_PER_TARGET:
+                raise ValueError(
+                    f"Eval target '{target_id}' already used all {EVAL_MAX_PER_TARGET} tries."
+                )
+            if used_count >= EVAL_MAX_SESSIONS:
+                raise ValueError(
+                    f"All {EVAL_MAX_SESSIONS} eval sessions have already been used."
+                )
+
+            run_no = max_run_nos.get(target_id, 0) + 1
+            run_id = f"eval_{target_id}_run{run_no}"
+            db_path = target_dir / f"{run_id}.db"
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.main",
+                "--scenario",
+                "eval",
+                "--target",
+                target_id,
+                "--run-no",
+                str(run_no),
+                "--max-sessions",
+                "1",
+                "--data-dir",
+                str(target_dir),
+            ]
+            if zero_pacing:
+                cmd.append("--zero-pacing")
+            if aggressive:
+                cmd.append("--aggressive")
+
+            logs_dir = target_dir / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_path = logs_dir / f"{run_id}.log"
+            with log_path.open("ab") as log_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.project_root),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+
+            info = ActiveRunInfo(
+                run_id=run_id,
+                scenario="eval",
+                target_id=target_id,
+                run_no=run_no,
+                mode="eval_live",
+                stub_objective=None,
                 pid=proc.pid,
                 db_path=str(db_path),
                 started_at=utc_now_iso(),

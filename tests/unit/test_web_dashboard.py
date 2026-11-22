@@ -519,3 +519,126 @@ async def test_stop_endpoint_clears_open_stage_and_cache(tmp_path: Path) -> None
             assert payload["execution_status"]["exit_reason"] == "stopped"
     finally:
         manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_eval_endpoints_guards_without_calling_target_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned_cmds: list[list[str]] = []
+
+    class _DummyProc:
+        pid = 99999
+
+        def poll(self) -> int | None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    def _fake_popen(cmd: list[str], **_kwargs: Any) -> _DummyProc:
+        spawned_cmds.append(list(cmd))
+        return _DummyProc()
+
+    monkeypatch.setattr("src.web.runner.subprocess.Popen", _fake_popen)
+
+    manager = RunManager(tmp_path)
+    app = create_app(tmp_path, run_manager=manager)
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1) Local status starts at 15 remaining (5 per target), 0 used
+            status_resp = await client.get("/api/eval/status")
+            assert status_resp.status_code == 200
+            assert status_resp.json() == {
+                "used_targets": [],
+                "target_counts": {},
+                "max_per_target": 5,
+                "used_count": 0,
+                "max_sessions": 15,
+                "remaining": 15,
+            }
+
+            # 2) Unconfirmed launch is rejected
+            unconfirmed = await client.post(
+                "/api/eval/launch",
+                json={"target_ids": ["eval_person_a"], "confirm": False},
+            )
+            assert unconfirmed.status_code == 400
+            assert spawned_cmds == []
+
+            # 3) Confirmed launch spawns --scenario eval --max-sessions 1
+            ok_resp = await client.post(
+                "/api/eval/launch",
+                json={
+                    "target_ids": ["eval_person_a", "eval_person_b"],
+                    "zero_pacing": True,
+                    "aggressive": True,
+                    "confirm": True,
+                },
+            )
+            assert ok_resp.status_code == 200
+            data = ok_resp.json()
+            assert [r["run_id"] for r in data["runs"]] == [
+                "eval_eval_person_a_run1",
+                "eval_eval_person_b_run1",
+            ]
+            assert data["eval_status"]["remaining"] == 13
+            assert data["eval_status"]["target_counts"] == {
+                "eval_person_a": 1,
+                "eval_person_b": 1,
+            }
+            assert len(spawned_cmds) == 2
+            assert "--scenario" in spawned_cmds[0] and "eval" in spawned_cmds[0]
+            assert "--max-sessions" in spawned_cmds[0] and "1" in spawned_cmds[0]
+
+            # 4) Same person can run up to 5 times total (run2..run5), 6th rejected
+            for expected_run_no in range(2, 6):
+                retry_resp = await client.post(
+                    "/api/eval/launch",
+                    json={"target_ids": ["eval_person_a"], "confirm": True},
+                )
+                assert retry_resp.status_code == 200
+                assert retry_resp.json()["runs"][0]["run_id"] == (
+                    f"eval_eval_person_a_run{expected_run_no}"
+                )
+
+            sixth_resp = await client.post(
+                "/api/eval/launch",
+                json={"target_ids": ["eval_person_a"], "confirm": True},
+            )
+            assert sixth_resp.status_code == 400
+
+            # 5) Fill remaining tries for person_b (4 more) and person_c (5) -> 15 total
+            for _ in range(4):
+                r = await client.post(
+                    "/api/eval/launch",
+                    json={"target_ids": ["eval_person_b"], "confirm": True},
+                )
+                assert r.status_code == 200
+            for _ in range(5):
+                r = await client.post(
+                    "/api/eval/launch",
+                    json={"target_ids": ["eval_person_c"], "confirm": True},
+                )
+                assert r.status_code == 200
+
+            final_status = (await client.get("/api/eval/status")).json()
+            assert final_status["used_count"] == 15
+            assert final_status["remaining"] == 0
+
+            # 16th total try rejected
+            sixteenth_resp = await client.post(
+                "/api/eval/launch",
+                json={"target_ids": ["eval_person_d"], "confirm": True},
+            )
+            assert sixteenth_resp.status_code == 400
+    finally:
+        manager.shutdown()

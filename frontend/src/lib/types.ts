@@ -361,3 +361,40 @@ export interface LaunchRunResponse {
   status: string;
   db_path: string;
 }
+
+export interface EvalTargetInfo {
+  id: string;
+  name: string;
+  role: string;
+}
+
+export interface EvalStatusResponse {
+  used_targets: string[];
+  target_counts: Record<string, number>;
+  max_per_target: number;
+  used_count: number;
+  max_sessions: number;
+  remaining: number;
+}
+
+export interface EvalScenariosResponse extends EvalStatusResponse {
+  id: string;
+  open: boolean;
+  company: string;
+  touch_budget: number;
+  targets: EvalTargetInfo[];
+  objectives: Array<{ id: string; text: string }>;
+}
+
+export interface LaunchEvalRequest {
+  target_ids: string[];
+  run_all: boolean;
+  zero_pacing: boolean;
+  aggressive: boolean;
+  confirm: boolean;
+}
+
+export interface LaunchEvalResponse {
+  runs: LaunchRunResponse[];
+  eval_status: EvalStatusResponse;
+}

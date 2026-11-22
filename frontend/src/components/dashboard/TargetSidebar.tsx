@@ -2,6 +2,7 @@
 
 import { RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
+import { LaunchEvalDialog } from "@/components/dashboard/LaunchEvalDialog";
 import { LaunchPracticeDialog } from "@/components/dashboard/LaunchPracticeDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -126,7 +127,12 @@ export function TargetSidebar({
             )}
           </>
         )}
-        {offlineReplaysAvailable === false && <LaunchPracticeDialog onLaunched={onLaunched} />}
+        {offlineReplaysAvailable === false && (
+          <div className="space-y-2">
+            <LaunchPracticeDialog onLaunched={onLaunched} />
+            <LaunchEvalDialog onLaunched={onLaunched} />
+          </div>
+        )}
 
         <Input
           value={search}
@@ -170,6 +176,11 @@ export function TargetSidebar({
                       >
                         {item.target_name || item.target_id}
                       </span>
+                      {item.scenario === "eval" && (
+                        <span className="shrink-0 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] font-medium text-amber-300">
+                          Eval
+                        </span>
+                      )}
                       {runTag && (
                         <span className="shrink-0 text-[11px] text-zinc-400">{runTag}</span>
                       )}
