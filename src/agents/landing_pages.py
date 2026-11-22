@@ -180,6 +180,11 @@ _HARVEST_PRETEXT_KEYWORDS: tuple[tuple[HarvestType, tuple[str, ...]], ...] = (
 )
 
 
+_PASSWORD_COMPATIBLE_HARVESTS: frozenset[HarvestType] = frozenset(
+    {"password_reset", "document_vault", "portal_login"}
+)
+
+
 def select_harvest_type(spec: LandingPageSpec) -> HarvestType:
     """Pick the template whose pretext and field signature best match ``spec``."""
     field_set = {f.strip().lower() for f in spec.fields if f.strip()}
@@ -187,8 +192,11 @@ def select_harvest_type(spec: LandingPageSpec) -> HarvestType:
         if field_set & signatures:
             return harvest
 
+    has_password_field = any("password" in f for f in field_set)
     lower_pretext = spec.pretext.strip().lower()
     for harvest, keywords in _HARVEST_PRETEXT_KEYWORDS:
+        if has_password_field and harvest not in _PASSWORD_COMPATIBLE_HARVESTS:
+            continue
         if any(re.search(rf"\b{re.escape(kw)}\b", lower_pretext) for kw in keywords):
             return harvest
     return "portal_login"

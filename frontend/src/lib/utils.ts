@@ -76,3 +76,16 @@ export function formatTimeShort(iso: string | null | undefined): string {
   if (Number.isNaN(d.getTime())) return iso.slice(11, 16) || iso;
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
+
+export function formatDuration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || Number.isNaN(ms) || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSec = ms / 1000;
+  if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+  const mins = Math.floor(totalSec / 60);
+  const secs = Math.floor(totalSec % 60);
+  if (mins < 60) return `${mins}m ${String(secs).padStart(2, "0")}s`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours}h ${String(remMins).padStart(2, "0")}m`;
+}

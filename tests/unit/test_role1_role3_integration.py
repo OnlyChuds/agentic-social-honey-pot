@@ -323,8 +323,8 @@ async def test_role1_role3_full_campaign_with_real_playwright_qa_and_portrait_up
         assert Path(final_snap.identity.portrait.local).is_file()
         assert len(mock_st.assets) == 1
 
-        # 3) IdentityAgent revised landing page after QA caught TODO on cycle 0
-        assert identity_llm.complete.call_count == 3
+        # 3) IdentityAgent rendered the deterministic branded landing page directly (passes QA on cycle 0)
+        assert identity_llm.complete.call_count == 1
         # Verify QA rendered PNG screenshots were saved to disk
         saved_renders = list((tmp_path / "renders").glob("*.png"))
         assert len(saved_renders) >= 3
@@ -633,9 +633,11 @@ async def test_identity_landing_page_fallback_on_llm_timeout_passes_qa(
             generate_images=False,
         )
         assert output.page_html is not None
+        assert identity_llm.complete.call_count == 0
         assert "<form" in output.page_html.html
         assert 'name="email"' in output.page_html.html
         assert 'name="password"' in output.page_html.html
+        assert "authenticator app" not in output.page_html.html.lower()
         assert proposal.payload["page_html"]["html"] == output.page_html.html
 
         async with HtmlRenderer() as renderer:

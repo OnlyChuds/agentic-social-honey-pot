@@ -71,10 +71,10 @@ SPEC = LandingPageSpec(
 
 
 @pytest.mark.asyncio
-async def test_landing_page_llm_failure_falls_back_to_harvest_template() -> None:
+async def test_landing_page_renders_branded_template_directly_without_llm() -> None:
     agent, llm = _agent()
     try:
-        llm.complete = AsyncMock(side_effect=RuntimeError("llm down"))  # type: ignore[method-assign]
+        llm.complete = AsyncMock(side_effect=AssertionError("LLM must not be called on landing_page"))  # type: ignore[method-assign]
         manifest = _manifest()
         output, _ = await agent.build(
             _snapshot(manifest),
@@ -82,6 +82,7 @@ async def test_landing_page_llm_failure_falls_back_to_harvest_template() -> None
             landing_page_spec=SPEC,
             generate_images=False,
         )
+        assert llm.complete.call_count == 0
         assert output.page_html is not None
         assert output.page_html.fields == ["email", "password"]
         # Harvest template signature: notice box, no generic "Continue" boilerplate
@@ -92,7 +93,7 @@ async def test_landing_page_llm_failure_falls_back_to_harvest_template() -> None
 
 
 @pytest.mark.asyncio
-async def test_landing_page_empty_llm_html_uses_harvest_template() -> None:
+async def test_revise_empty_llm_html_falls_back_to_harvest_template() -> None:
     agent, llm = _agent()
     try:
         manifest = _manifest()
@@ -109,10 +110,11 @@ async def test_landing_page_empty_llm_html_uses_harvest_template() -> None:
         )
         output, _ = await agent.build(
             _snapshot(manifest),
-            mode="landing_page",
+            mode="revise",
             landing_page_spec=SPEC,
             generate_images=False,
         )
+        assert llm.complete.call_count == 1
         assert output.page_html is not None
         assert "password" in output.page_html.fields
         assert 'class="notice"' in output.page_html.html

@@ -21,6 +21,7 @@ from src.models import (
 )
 
 logger = logging.getLogger(__name__)
+_PROFILE_MAX_TOKENS = 512
 
 
 class HookUpdate(BaseModel):
@@ -118,11 +119,23 @@ class ProfileAgent(BaseAgent):
                 "disclosures (list of {claim, evidence_event, confidence, public_or_not})",
                 "rationale (str)",
             ],
+            "instructions": (
+                "Return ONLY compact minified JSON (<=512 tokens, no indentation): <=15-word "
+                "style_guide/trust_style/rationale, <=3 psych traits, <=2 stressors, <=3 short "
+                "watchouts, <=1 new_hooks (or [] if existing hooks suffice), and hook_updates "
+                "only for hooks with new engagement evidence."
+            ),
         }
 
+        profile_max_tokens = min(self.prompt.max_tokens, _PROFILE_MAX_TOKENS)
         try:
             payload = await asyncio.wait_for(
-                self.run_json(context, ProfileProposalPayload, retries=1),
+                self.run_json(
+                    context,
+                    ProfileProposalPayload,
+                    max_tokens=profile_max_tokens,
+                    retries=1,
+                ),
                 timeout=70.0,
             )
         except Exception as exc:  # noqa: BLE001

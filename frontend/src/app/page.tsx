@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityTabs } from "@/components/dashboard/ActivityTabs";
 import { KpiStrip } from "@/components/dashboard/KpiStrip";
 import { PersonalityEvolutionPanel } from "@/components/dashboard/PersonalityEvolutionPanel";
+import { RunExecutionStatus } from "@/components/dashboard/RunExecutionStatus";
 import { StagePipeline } from "@/components/dashboard/StagePipeline";
 import { SuspicionChart } from "@/components/dashboard/SuspicionChart";
 import { TargetSidebar } from "@/components/dashboard/TargetSidebar";
@@ -284,6 +285,11 @@ export default function DashboardPage() {
               activeState={displayedState}
               onStopRun={handleStopRun}
               stopping={stopping}
+            />
+
+            <RunExecutionStatus
+              executionStatus={detail.execution_status}
+              state={detail.summary.state}
             />
 
             <KpiStrip

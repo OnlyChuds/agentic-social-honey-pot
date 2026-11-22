@@ -54,6 +54,7 @@ class Store:
     def _init_db(self) -> None:
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA busy_timeout=5000;")
         cur.execute("PRAGMA synchronous=NORMAL;")
         cur.execute("PRAGMA foreign_keys=ON;")
         cur.executescript(

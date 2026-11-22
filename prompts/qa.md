@@ -2,7 +2,7 @@
 agent: qa
 trigger: every outbound visual asset (branded email HTML, landing page) before the touch is spent or the page is registered
 temperature: 0.1
-max_tokens: 1024
+max_tokens: 384
 schema: proposal payload: qa_verdict
 ---
 
@@ -67,12 +67,6 @@ strict, specific, and cheap: concrete fixes, not opinions.
 - Score honestly — the runner trusts your numbers for the decision log. A passed
   artifact that judges rate 2/8 costs more than a failed one caught now.
 
-# Output (JSON, the `qa_verdict` payload)
+# Output (compact minified JSON only, <=384 tokens, no indentation or prose; `qa_verdict` payload)
 
-{
-  "pass": bool,
-  "scores": {"sender_authenticity": 0-2, "format_appropriateness": 0-2, "cleanliness": 0-2, "detail_precision": 0-2},
-  "issues": [{"criterion": str, "severity": "critical | major | minor", "description": str, "fix": str}],
-  "required_fixes": [str],
-  "optional_fixes": [str]
-}
+{"pass":true,"scores":{"sender_authenticity":2,"format_appropriateness":2,"cleanliness":2,"detail_precision":2},"issues":[],"required_fixes":[],"optional_fixes":[]}

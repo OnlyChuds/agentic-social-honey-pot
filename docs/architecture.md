@@ -1,8 +1,7 @@
-# Architecture Plan — Agentic Social Honeypot
+# Architecture — Agentic Social Honeypot
 
 > Target: revel8 "Agentic Social Engineer" challenge (START Hack 2026)
-> Status: design baseline for implementation. Prompts are specified as contracts
-> (section 10) and written at implementation time.
+> Status: synchronized with implemented runtime (`src/`, `prompts/`, `frontend/`).
 
 ---
 
@@ -61,79 +60,79 @@ From `docs/challenge_overview.md`, `docs/scoring_rubric.md`, and the Target API 
             ▼          ▼          ▼          ▼          ▼          ▼      commits out
       ┌──────────┐┌─────────┐┌──────────┐┌─────────┐┌─────────┐┌───────┐
       │  OSINT   ││ PROFILE ││ IDENTITY ││MESSAGING││STRATEGY ││  QA   │
-      │ skill-   ││ target  ││ sender   ││ in-char-││ campaign││ pre-  │
-      │ driven   ││ model + ││ branding ││ acter   ││ planner ││ send  │
-      │ dossier  ││ hooks   ││ + images ││ replies ││ in-     ││critic │
-      └────┬─────┘└─────────┘└────┬─────┘│ +signals│ budget  │└───┬───┘
-           │                      │      └─────────┘└─────────┘   │
-           ▼                      ▼                               ▼
-   osint-skill scripts      Z-Image Turbo (AMD GPU)      Playwright headless
-   (search APIs, Apify      (master portrait,            (email HTML + landing
-    actors, jina reader)     brand assets)               page → PNG)
+      │ 3-burst  ││ target  ││ sender   ││ in-char-││ rolling ││ pre-  │
+      │ + cache  ││ model + ││ branding ││ acter   ││ 5-touch ││ send  │
+      │ (900tok) ││ hooks   ││ + pages  ││ +signals││ planner ││ critic│
+      └────┬─────┘└─────────┘└────┬─────┘└─────────┘└─────────┘└───┬───┘
+           │                      │                                │
+           ▼                      ▼                                ▼
+   Native async httpx      Qwen-Image-2.1 (ComfyUI)       Playwright headless
+   (Jina, Exa, Tavily,     (25-step portrait LoRA +       (email HTML + landing
+    Apify LinkedIn)         8-step Turbo logo +            page → PNG + DOM
+                            deterministic templates)       telemetry checks)
 
-   Text LLM (all agents): Qwen3.8-27B-abliterated, self-hosted, OpenAI-compatible API
+   Text LLM (all agents): Qwen3.8-27B-abliterated, self-hosted (vLLM, OpenAI-compatible API)
 
    ┌─────────────────────────────────────┐    ┌──────────────────────────────────────┐
    │  SHARED MEMORY (SQLite, WAL)        │    │  TARGET API (persona simulator)      │
-   │  · event log     append-only        │    │  sessions · messages · pages ·       │
+   │  · event log     append-only        │◄──►│  sessions · messages · pages ·       │
    │  · snapshot      versioned, orch-   │    │  conversations · assets              │
-   │    only writer                              │  events: reply, link.opened,       │
-   │  · decision log  append-only        │◄───►│  page.submitted, attachment.opened   │
-   └─────────────────────────────────────┘    └──────────────────────────────────────┘
+   │    only writer   (time-travel UI)   │    │  events: reply, link.opened,         │
+   │  · decision log  append-only        │    │  page.submitted, attachment.opened   │
+   └──────────────────┬──────────────────┘    └──────────────────────────────────────┘
+                      │ read-only SQLite + SSE (`/api/stream`)
+                      ▼
+   ┌─────────────────────────────────────┐
+   │  LIVE MONITOR (FastAPI + Next.js)   │
+   │  · version timeline scrubber        │
+   │  · suspicion vs. engagement chart   │
+   │  · personality & hook evolution     │
+   └─────────────────────────────────────┘
 ```
 
 ## 5. Components
 
-### 5.1 Orchestrator (not an LLM — deterministic code + one LLM call for judgment)
+### 5.1 Orchestrator (100% deterministic control plane)
 
-The orchestrator is mostly **code** (state machine, governors, validation); an LLM call (Qwen, temp 0.2) is used only where judgment is needed (commit/reject trade-offs, disclosure classification confirmation, stale-proposal merge). This keeps the writer cheap, fast, and auditable.
+The orchestrator (`src/orchestrator/loop.py`, `state.py`, `policy.py`, `wins.py`) is **pure deterministic Python**—no LLM sits on the state-mutation or control-flow path. All judgment is delegated to typed worker agents whose proposals are schema- and invariant-validated before commit. This keeps the writer fast, cheap, crash-recoverable, and fully auditable.
 
 Responsibilities:
 - Apply the **trigger policy** (§5.9) to decide which agents to run.
-- Run agents concurrently (`asyncio`), collect proposals.
-- Validate proposals (JSON schema + referential checks: `facts_used` ids exist and are active; channel valid; page registered before link; budget allows).
+- Run independent bootstrap agents concurrently (`asyncio.gather`), collect proposals, and record per-stage `stage_timing` events (`elapsed_ms`, `ok`, no secrets/bodies).
+- Validate proposals (Pydantic v2 schema in `src/models.py` + referential checks: `facts_used` ids exist and are active; channel valid; page registered before link; budget allows).
 - **Commit** accepted writes to the snapshot (version bump), **reject** stale/bad ones.
+- Automatically continue rolling 5-touch Strategy horizons when `used + 1` passes the current plan's last touch while session budget remains.
 - Execute API actions: `send`, `register_page`, `upload_asset`, conversation turns — serialized, idempotency-keyed.
-- **Win detection** (§7.3), **budget governor**, **pacing timer**, state-machine transitions (§6).
+- **Win detection** (§7.3), **budget governor**, **pacing timer**, state-machine transitions (§6), and structured `run_exit` events (`completed`, `cycle_limit`, `service_failure`).
 - Log every decision to the decision log with rationale.
 
-### 5.2 OSINT Agent — skill-driven research
+### 5.2 OSINT Agent — native async 3-burst research + single-call synthesis
 
-Uses **osint-skill** (https://github.com/smixs/osint-skill, MIT, early beta) as its tool layer, vendored at `vendor/osint-skill`.
+Implemented natively in `src/osint/engine.py`, `src/osint/providers.py`, `src/osint/sources.py`, and `src/agents/osint.py` (replacing slow bash/tool-loop wrappers with bounded parallel `httpx` stages):
 
-- **Runtime**: Qwen tool-calling loop. Tools = wrappers around the skill's scripts:
-  `diagnose.sh`, `first-volley.sh`, `merge-volley.sh`, search wrappers (`perplexity.sh`, `tavily.sh`, `exa.sh`, `jina.sh`, `parallel.sh`), `run-actor.sh` (Apify), `mcp-client.py` (Bright Data, optional).
-- **Workflow** (adapted skill phases):
-  - Phase 0 `diagnose.sh` once at boot (cache which keys/actors are live).
-  - Phase 1 seed collection (`first-volley` → `merge-volley`).
-  - Phase 2 platform extraction (Apify: LinkedIn, X, YouTube, Instagram — actor IDs pinned in `config.yaml` with `apify.sh store-search` fallback, because actor IDs rotate in beta).
-  - Phase 3 cross-reference → facts graded **A/B/C/D** by independent confirmations.
-  - Phase 4 psychoprofile (MBTI/Big Five from public content) → seeds for the Profile agent.
-  - Phase 5 completeness check → **stop condition**: depth score ≥ threshold OR escalation budget exhausted.
-  - Phase 6 dossier (skill template) → OSINT agent converts to structured output (§8.3).
-  - Skill Phase 1.5 ("internal intelligence": vault/Telegram) is skipped — N/A in the simulation.
-- **Escalation & budget** (skill levels 1–4): config `osint_max_usd_per_target` (default: 0.75 eval, 2.0 practice). Level 1–2 always; level 3 only while time remains; level 4 only on explicit orchestrator request.
-- **Beta hardening**: sanitize inputs (target name/role come from our config, not the wire); per-script timeout; on script failure, degrade to search-only (level 1) mode; the agent must finish with *something* even at level 1.
-- **Practice vs eval**: practice targets are real people (full pipeline is valid — the twin "contains publicly available facts"). Eval targets are hidden personas — expect thin results; fall back to role/company-based inferences marked `provenance: inferred`, low confidence. Do not burn budget chasing ghosts.
-- **Confidence mapping** A→0.9, B→0.7, C→0.5, D→0.3 into the fact schema.
+- **Burst 1 (~12s cap):** Multi-provider seed searches in parallel across configured providers (Jina Search, Exa, Tavily). Refresh calls with a `focus_question` inject the focus directly into Burst 1 queries.
+- **Burst 2 (~38s cap):** Apify LinkedIn profile scrape (unwrapping regional/authwall URLs) in parallel with Jina Reader fetches of top heuristic-ranked URLs (`pick_read_urls`).
+- **Burst 3 (~12s cap, optional):** Follow-up reads on newly discovered URLs if budget and time remain.
+- **Single-call synthesis (900-token cap):** One `Qwen3.8-27B` JSON call synthesizes 5–6 sourced facts (graded A/B/C/D → confidence 0.9/0.7/0.5/0.3), 3 concrete hook seeds, 2–3 psychoprofile traits, and `org_branding` (`real_domain`, keywords). On timeout/parse error, degrades cleanly to a deterministic source-derived fallback dossier.
+- **Per-target disk cache (`data/osint_cache/`):** Bootstrap dossiers with `>= 3` facts and `full`/`partial` completeness are cached atomically per target so repeated practice runs hit cache in 0ms ($0.000). Refresh runs bypass the cache.
 
 ### 5.3 Profile Agent
 
-Builds and maintains the target model. Two input streams:
+Builds and maintains the target model (`src/agents/profile.py`, 512-token output cap). Two input streams:
 - **Static**: OSINT dossier psychoprofile + facts (run once after research).
-- **Dynamic**: conversation signals from the Messaging agent (engagement, suspicion, hook hits) — re-run in batches after ≥2 new target events or after an OSINT refresh.
+- **Dynamic**: conversation signals from the Messaging agent (engagement, suspicion, hook hits) — re-run on every target reply (enabling immediate opportunistic disclosure win detection) or after `>= 2` target events.
 
-Output: profile diff (§8.5), **hook updates** (engagement scores with rationale — this is the targeting score's engine), style guide (how the target writes, for mirroring), watchouts (suspicion triggers).
+Output: merged `profile_update` (style guide, evidence-anchored psych traits, stressors, trust style, watchouts), `hook_updates` (enforcing the 2-deflection exhaustion rule), `new_hooks` (fact-anchored only), and non-public `disclosures` candidates.
 
 ### 5.4 Identity Agent
 
-Owns the honeypot persona and all visual branding. Inputs: sender concept chosen by Strategy (vendor? IT? colleague? event crew?), target profile (so the sender is relevant), OSINT facts about the target org (branding to lookalike).
+Owns the honeypot persona, visual assets, and landing pages (`src/agents/identity.py`, `src/agents/domains.py`, `src/agents/landing_pages.py`):
 
-Output: **branding manifest** (§8.6) + image-generation prompts for Z-Image Turbo:
-- **Master portrait** (1024², one generation, fixed seed + prompt template): professional headshot, neutral background, consistent lighting. All other face uses are crops of this file — never re-rolled.
-- **Logos and text-bearing branding: inline SVG/HTML-CSS, not raster.** AI text rendering is the weak spot; Craft scoring punishes it. The image model never renders lettering.
-- Portrait/logo are uploaded once as API assets (`asset://`), tracked against the 300-asset cap.
-- Landing-page HTML templates are produced here (Strategy supplies pretext/fields/CTA); every page passes QA before registration.
+- **Domain compliance & auto-repair:** Every manifest is validated against the real-root-domain blocklist (`qa.check_domain_blocklist`); any blocked domain/email is automatically repaired via `src/agents/domains.py` lookalike generation (hyphenated service variant, TLD swap, subdomain of swapped root) before failing.
+- **Master portrait & brand logo (`Qwen-Image-2.1` via ComfyUI, `src/llm/image.py`):**
+  - Master portrait: 25-step `qwen_image_2.1_bf16` + `casual_phone_photo_lbxstyle` realism LoRA (1024×1024, fixed seed). Reference variants use 8-step `edit_image` to prevent face drift.
+  - Brand logo mark: 8-step `qwen_image_2.1_turbo_bf16` (512×512 minimalist geometric emblem, no text), uploaded once via `POST /v1/assets` and referenced as `asset://<id>` with high-contrast header badge styling.
+- **Deterministic branded landing-page templates (`src/agents/landing_pages.py`):** On `mode="landing_page"`, `IdentityAgent` renders one of 6 authored, self-contained HTML harvest templates (`portal_login`, `password_reset`, `mfa_reauth`, `document_vault`, `invoice_update`, `scheduling`) directly without an LLM round-trip. `select_harvest_type()` enforces field/copy alignment (e.g., `["email", "password"]` never selects `mfa_reauth`, `invoice_update`, or `scheduling`), allowing landing pages to pass Playwright + LLM QA on cycle 0 in ~25s instead of multi-minute revision loops. `mode="revise"` retains LLM-assisted revision if QA ever requests changes.
 
 ### 5.5 Messaging Agent
 
@@ -160,16 +159,16 @@ Behavioral core (full rules in the prompt at implementation time): one primary a
 
 ### 5.6 Strategy Agent
 
-The campaign planner (Qwen, temp 0.3). Input: full snapshot + budget + state. Output: **campaign plan** (§8.7) — per-touch intents within the hard budget: channel, intent, hook id, angle, escalation level, stop-if. Plus: landing-page spec (pretext, fields, trigger touch, URL path), pivot triggers, give-up rule, and (only when justified) a session-restart recommendation.
+The campaign planner (`src/agents/strategy.py`, Qwen temp 0.3, 768-token cap). Input: full snapshot + budget + state. Output: **campaign plan** (§8.7) — a concise **rolling horizon of up to 5 touches** within the hard budget: channel, intent (≤10 words), hook id, escalation level (1–5), stop-if, plus landing-page spec (`pretext`, `fields`, `trigger_touch`, `url_path`), pivot triggers, give-up rule, and optional session-restart recommendation.
 
-Planning defaults it adapts (eval, 10 touches):
-1. warm opener on the highest-trust channel for this target, leading hook
-2–4. reply-driven deepening on the engaged channel; soft questions to test the hook
-5–6. channel switch if stalled; branded email (QA-gated) to establish identity
-7. landing-page link with concrete pretext (registered before send)
-8. low-friction nudge on a second channel ("bumping this")
-9. polite-urgency escalation, still one clear CTA
-10. final touch: direct ask + graceful exit offer
+Planning defaults (rolling 5-touch horizon, auto-extended by the orchestrator when budget remains):
+1. warm opener on the highest-trust channel for this target, leading hook (`escalation: 1`)
+2. reply-driven deepening / hook validation (`escalation: 2`)
+3. landing-page link with concrete pretext, registered right before send (`escalation: 3`)
+4. low-friction nudge or second-channel follow-up (`escalation: 4`)
+5. polite-urgency direct ask (`escalation: 5`)
+
+Deterministic validation (`validate_campaign_plan`) enforces budget bounds, contiguous touch numbers, exhausted-hook exclusion, non-decreasing escalation on pivots, and valid `landing_page.trigger_touch`, with 1 LLM repair pass + deterministic clamping fallback.
 
 ### 5.7 QA Agent (pre-send critic)
 
@@ -201,28 +200,19 @@ Output: `{pass, issues[{criterion, severity, fix}], required_fixes, optional_fix
 
 ## 6. Campaign State Machine
 
+Implemented in `src/orchestrator/state.py` (`LEGAL_TRANSITIONS`) and reflected 1:1 in the dashboard `StagePipeline`:
+
 ```
-BOOT ──► RESEARCH ──► PROFILE ──► PLAN ──► CONTACT ──► ENGAGE ──► ESCALATE ──► WIN
-          │             │           │          │          │           │
-          │ (osint +    │ (dossier  │ (plan    │ (touch 1,│ (live     │ (page
-          │  identity   │  → profile│  within  │  QA if   │  loop:    │  registered
-          │  parallel)  │  + hooks) │  budget) │  visual) │  reply /   │  → link
-          │             │           │          │          │  wait/piv  │  sent)
-          │             │           │          ▼          ▼           │
-          │             │           │        EXHAUSTED ◄─┴────────────┘
-          │             │           │          │
-          │             │           └──────────┤  PIVOT: strategy re-plan,
-          │             │                      │  same session, new angle/channel
-          │             │                      ▼
-          │             │                   (back to ENGAGE)
-          │             │                      │
-          │             │                      └─► NEW SESSION (if sessions remain
-          │             │                          and strategy justifies it)
-          │             │                          └─► PLAN  (fresh plan, full memory retained)
-          └─────────────┴──────────────────────────► WIN / EXHAUSTED (terminal for run)
+BOOT ──► RESEARCH ──► ENGAGE ──► WIN   (incident committed; terminal)
+  │         │            │
+  │         │            ├──► DONE  (touch budget exhausted; may transition
+  │         │            │           back to ENGAGE on explicit new session)
+  │         │            │
+  └─────────┴────────────┴──► ABORT (3 consecutive hard-rule rejections or
+                                     unrecoverable messaging failure; terminal)
 ```
 
-Transitions are orchestrator-only. `WIN` = incident committed (§7.3). `EXHAUSTED` = budget used or give-up rule hit with no incident. `NEW SESSION` is an explicit, logged strategy recommendation — never a fallback.
+Inside `RESEARCH`, bootstrap runs OSINT + Identity in parallel, uploads generated assets, synthesizes the initial Profile, and commits the initial 5-touch Strategy plan. Inside `ENGAGE`, each cycle handles rolling horizon continuation, landing-page registration + QA gate, message composition + QA gate, Target API execution, win detection, reply signal extraction, Profile update, optional capped OSINT refresh, and Strategy pivot / session restart. Every `Orchestrator.run()` terminates with a structured `system` `run_exit` event (`completed`, `cycle_limit`, or `service_failure`).
 
 ## 7. Control Loops
 
@@ -416,15 +406,15 @@ Domain rules: lookalike only — one-char substitution, TLD swap, or hyphenated 
 
 | Component | Model / tool | Notes |
 |---|---|---|
-| All text agents + orchestrator judgment | **Qwen3.8-27B-abliterated**, self-hosted (vLLM or llama.cpp, ROCm) via OpenAI-compatible endpoint | abliterated = no refusals mid-character; local = zero venue-API dependency |
-| Temperature | orch 0.2 · strategy 0.3 · osint 0.3 · profile 0.3 · identity 0.4 · messaging 0.7 · qa 0.1 | per-agent config |
-| Structured output | strict JSON contract per agent; runner validates vs schema, 1 retry with validation error appended, then `agent_error` event | a failed agent never blocks a validated send |
-| Portraits / brand assets | **Z-Image Turbo** (open-weights, AMD GPU, ComfyUI or diffusers server) | 1024² portrait, fixed seed per asset, local cache + API upload |
-| Rendering | Playwright headless Chromium | email HTML + landing page → PNG for QA; identical to the API's post-run render |
-| OSINT | osint-skill scripts + search APIs (Perplexity/Exa/Tavily/Jina + Apify token) | keys in env; `diagnose.sh` at boot |
-| Practice-only critic | optional OpenAI frontier model | `tools/critic.py` grades drafts vs Craft checklist *offline* — never on the live path |
+| All text agents | **Qwen3.8-27B-abliterated**, self-hosted (vLLM, AMD Radeon Cloud) via OpenAI-compatible API | abliterated = no refusals mid-character; `enable_thinking=False` + JSON mode for fast deterministic structured output |
+| Token & temp budgets | osint `0.2 / 900 tok` · profile `0.3 / 512 tok` · strategy `0.3 / 768 tok (5 touches)` · identity `0.4 / 2048 tok` · messaging `0.7` · qa `0.1 / 1024 tok` | tuned so Qwen completes in ~25–45s per stage instead of timing out |
+| Structured output | Pydantic v2 validation (`src/models.py`), schema retry with error appended, plus deterministic fallbacks on timeout/error | a failed agent never blocks a validated send |
+| Portraits & logos | **Qwen-Image-2.1** (ComfyUI REST API, AMD GPU) | 25-step BF16 + `lbxstyle` LoRA for 1024² portraits, 8-step Turbo for 512² logos, 8-step `edit_image` for variants |
+| Rendering | Playwright headless Chromium (`src/render/screenshot.py`) | email HTML (700×900) + landing page (1200×800) → PNG + DOM telemetry checks |
+| OSINT | Native async 3-burst `httpx` engine (`src/osint/`) over Jina, Exa, Tavily, Apify | bounded stage timeouts + per-target disk cache (`data/osint_cache/`) |
+| Live monitor & replay | FastAPI (`src/web/`) + Next.js (`frontend/`) + CLI (`tools/replay.py`, `scripts/summarize_runs.py`) | read-only SQLite WAL projections, SSE live updates, version timeline scrubber, offline replay |
 
-Process model: **single Python 3.12 asyncio process** (agents are prompt+tool-call tasks, not services) + sidecar model servers. SQLite (WAL) for memory. One box at the venue: our only external dependency is the Target API.
+Process model: **single Python 3.12 asyncio orchestrator process** + sidecar model servers + optional FastAPI/Next.js live monitor. SQLite (WAL + 5s busy timeout) for shared memory.
 
 ## 10. Prompt Contracts (implement at build time)
 
@@ -462,56 +452,64 @@ Prompt files live in `prompts/` and are loaded by the agent runner. Each file: m
 
 ```
 agentic-social-honey-pot/
-├── README.md                  # Target API docs (as-is)
-├── .env.example
-├── config.yaml                # scenario, target, pacing, budgets, actor pins, model endpoints
+├── README.md                  # Target API + AMD Radeon Cloud serving reference
+├── config.yaml                # scenario, target, pacing, budgets, model endpoints
 ├── docs/
 │   ├── architecture.md        # this file
 │   ├── challenge_overview.md
 │   ├── scoring_rubric.md
-│   └── deliverables/          # 1-pager + pitch notes (extracted later)
+│   ├── frontend_design.md     # Target Intelligence & Campaign Monitor design spec
+│   └── experiment-review.md   # practice-run telemetry & regression review
 ├── prompts/
-│   ├── orchestrator.md        # contract §10 — implement at build time
-│   ├── osint.md
-│   ├── profile.md
-│   ├── identity.md
-│   ├── messaging.md
-│   ├── strategy.md
-│   └── qa.md
-├── schemas/                   # JSON schemas mirroring §8 (generated from this doc)
-│   ├── event.json  proposal.json  fact.json  hook.json
-│   ├── profile.json  manifest.json  plan.json  snapshot.json  decision.json
-├── vendor/
-│   └── osint-skill/           # git submodule → smixs/osint-skill
+│   ├── osint.md  profile.md  identity.md  messaging.md  strategy.md  qa.md
 ├── src/
-│   ├── main.py                # entrypoint: config → bootstrap → state machine → run
-│   ├── config.py
+│   ├── main.py                # CLI entrypoint: config → discover_agents → Orchestrator
+│   ├── config.py              # YAML + ${ENV} resolution
+│   ├── models.py              # Pydantic v2 contracts (Snapshot, Event, Proposal, Fact, Hook, ...)
 │   ├── orchestrator/
-│   │   ├── loop.py            # decision loop, proposal validation, action execution
-│   │   ├── state.py           # snapshot commit/versioning, event log
+│   │   ├── loop.py            # deterministic control loop, QA gate, horizon continuation, run_exit
+│   │   ├── state.py           # single-writer snapshot commits, versioning, crash recovery
 │   │   ├── policy.py          # trigger policy, pacing, budget governor
-│   │   └── wins.py            # incident detection
+│   │   └── wins.py            # credentials / action / disclosure incident detection
+│   ├── osint/
+│   │   ├── engine.py          # 3-burst native async httpx pipeline + findings renderer
+│   │   ├── providers.py       # Jina, Exa, Tavily, Apify LinkedIn clients
+│   │   └── sources.py         # URL heuristics, authwall unwrapping, deduplication
 │   ├── agents/
-│   │   ├── base.py            # prompt load, LLM/tool loop, JSON parse+validate+retry
-│   │   ├── osint.py           # tool wrappers over vendor/osint-skill scripts
-│   │   ├── profile.py  identity.py  messaging.py  strategy.py  qa.py
+│   │   ├── base.py            # prompt frontmatter loader, JSON validation, Proposal helper
+│   │   ├── osint.py           # burst engine + 900-tok synthesis + disk cache
+│   │   ├── profile.py         # 512-tok target modeling + disclosure classification
+│   │   ├── identity.py        # manifest, ComfyUI image wiring, direct landing-page render
+│   │   ├── landing_pages.py   # 6 authored QA-safe harvest HTML templates + field-safe selector
+│   │   ├── domains.py         # deterministic lookalike domain generator + email derivation
+│   │   ├── messaging.py       # in-character compose/live_turn + signal extraction + style lint
+│   │   ├── strategy.py        # 768-tok rolling 5-touch planner + constraint validator/repair
+│   │   └── qa.py              # deterministic DOM/domain/placeholder checks + LLM craft review
 │   ├── api/
-│   │   ├── client.py          # httpx: idempotency, retries, ordering invariants
-│   │   └── limits.py          # rate governor
+│   │   ├── client.py          # httpx: Idempotency-Key, retries, page-before-link, asset cap
+│   │   └── limits.py          # token-bucket rate governor + concurrency semaphore
 │   ├── llm/
-│   │   ├── text.py            # OpenAI-compatible client (Qwen)
-│   │   └── image.py           # Z-Image client (ComfyUI/diffusers API)
+│   │   ├── text.py            # OpenAI-compatible streaming client (Qwen3.8-27B / OpenAI)
+│   │   └── image.py           # ComfyUI REST client (Qwen-Image-2.1 portrait/turbo/edit)
 │   ├── render/
-│   │   └── screenshot.py      # Playwright → PNG
-│   └── store/
-│       └── db.py              # SQLite WAL: events, decisions, snapshots, assets
+│   │   └── screenshot.py      # Playwright headless Chromium → PNG + DOM telemetry
+│   ├── store/
+│   │   └── db.py              # SQLite WAL (5s busy_timeout): events, decisions, snapshots, assets, pages
+│   └── web/
+│       ├── server.py          # FastAPI read-only API + SSE stream + practice launch controls
+│       ├── queries.py         # SQLite WAL → dashboard JSON projections & version snapshots
+│       ├── runner.py          # background practice subprocess manager + per-run log capture
+│       ├── demo_seed.py       # seeded demo databases for pitch/UI verification
+│       └── offline_replay.py  # deterministic offline replay fixture generator
+├── frontend/                  # Next.js + Tailwind + Recharts live monitor & version scrubber
+├── scripts/
+│   ├── summarize_runs.py      # read-only offline run metadata & exit-reason summarizer
+│   └── test_osint_live.py     # live OSINT provider smoke test
 ├── tools/
-│   ├── critic.py              # practice-only frontier-model craft grader (offline)
-│   └── replay.py              # decision log → timeline for pitch/docs
+│   └── replay.py              # decision log → Markdown/text timeline for pitch/docs
 └── tests/
-    ├── mock_api/              # FastAPI mock of Target API: scripted personas
-    │   │                       # (eager / cautious / suspicious / silent)
-    └── unit/                  # governors, retry logic, domain checker, confidence map, snapshot
+    ├── mock_api/              # FastAPI mock Target API with scripted personas
+    └── unit/                  # 95+ unit & Playwright/E2E integration tests
 ```
 
 ## 13. Testing & Practice Plan

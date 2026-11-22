@@ -56,8 +56,8 @@ export function launchPracticeRun(req: LaunchRunRequest): Promise<LaunchRunRespo
   });
 }
 
-export function stopPracticeRun(runId: string): Promise<{ run_id: string; status: string }> {
-  return fetchJson<{ run_id: string; status: string }>(
+export function stopPracticeRun(runId: string): Promise<{ run_id: string; stopped: boolean }> {
+  return fetchJson<{ run_id: string; stopped: boolean }>(
     `/api/runs/${encodeURIComponent(runId)}/stop`,
     { method: "POST" }
   );
