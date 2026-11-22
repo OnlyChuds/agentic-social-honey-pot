@@ -39,10 +39,16 @@ aim at. A wrong hook costs up to −5 points; a well-aimed one is the whole game
    `engagement` (touches_touched, positive, score 0–1) with a one-line rationale.
    A hook deflected twice goes `status: "exhausted"`. New candidate hooks are
    allowed only when grounded in a fact id.
-3. **Disclosure classification** (only when a reply may contain non-public data):
-   for each candidate emit `{"claim", "evidence_event", "confidence", "public_or_not"}`.
-   The orchestrator confirms at >= 0.7. Be strict about "non-public": not on the
-   company website, not in public talks or posts.
+3. **Disclosure classification** (when a reply, call transcript, or `page_submissions`
+   contains non-public internal data): emit
+   `{"claim", "evidence_event", "confidence", "public_or_not"}`. The orchestrator
+   confirms at >= 0.7. Be strict about "non-public": not on the company website,
+   not in public talks or posts.
+4. **Committed action classification** (`actions_taken` — ONLY when the target
+   explicitly performed a concrete requested action in a reply or live call, such
+   as approving a request/invoice, changing a payment detail, or granting access):
+   emit `{"action", "evidence_event", "confidence", "committed": true}`. NEVER
+   count merely opening a link/attachment or filling basic contact fields.
 
 # Rules
 
@@ -55,5 +61,5 @@ aim at. A wrong hook costs up to −5 points; a well-aimed one is the whole game
 - Output ONLY compact minified JSON (<=512 tokens, no indentation or extra whitespace) using these EXACT keys. Keep `style_guide`, `trust_style`, and `rationale` <=15 words each; emit at most 3 `psych` traits, 2 `stressors`, 3 short `watchouts`, and at most 1 `new_hooks` item (use `[]` if existing hooks suffice); only emit `hook_updates` for hooks with new engagement evidence:
 
 ```json
-{"profile_update":{"style_guide":"concise style guidance","psych":[{"trait":"short trait","confidence":0.7,"evidence":["f_01"]}],"stressors":[{"topic":"short topic","confidence":0.6,"evidence":["f_01"]}],"trust_style":"short trust preference","watchouts":["short watchout"],"timezone_hint":"Europe/Berlin","language":"en","overall_confidence":0.7},"hook_updates":[],"new_hooks":[],"disclosures":[],"rationale":"short one-line summary"}
+{"profile_update":{"style_guide":"concise style guidance","psych":[{"trait":"short trait","confidence":0.7,"evidence":["f_01"]}],"stressors":[{"topic":"short topic","confidence":0.6,"evidence":["f_01"]}],"trust_style":"short trust preference","watchouts":["short watchout"],"timezone_hint":"Europe/Berlin","language":"en","overall_confidence":0.7},"hook_updates":[],"new_hooks":[],"disclosures":[],"actions_taken":[],"rationale":"short one-line summary"}
 ```

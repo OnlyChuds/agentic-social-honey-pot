@@ -5,15 +5,20 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from src.agents.messaging import MAX_CONVERSATION_TURNS, StoryClock
+from src.agents.visual_artifacts import render_visual_artifact_png
 from src.api.client import (
     AssetLimitError,
     BudgetExhaustedError,
+    ConversationEndedError,
     PageNotRegisteredError,
     SimulatorRejectionError,
+    StoryTimeError,
     TargetAPIClient,
     TargetAPIError,
 )
@@ -23,6 +28,7 @@ from src.models import (
     DecisionAction,
     DecisionRecord,
     Event,
+    LandingPageSpec,
     Proposal,
     QAVerdict,
     Snapshot,
@@ -31,7 +37,12 @@ from src.models import (
 )
 from src.orchestrator.policy import TriggerPolicy
 from src.orchestrator.state import VALID_CHANNELS, CommitResult, StateManager
-from src.orchestrator.wins import evaluate_wins
+from src.orchestrator.wins import (
+    classify_page_submission,
+    evaluate_wins,
+    extract_page_submission_summary,
+)
+from src.store.memory import TargetMemory, TargetMemoryStore
 
 SleepFn = Callable[[float], Awaitable[None]]
 
@@ -82,6 +93,9 @@ class Orchestrator:
         policy: TriggerPolicy | None = None,
         aggressive: bool = False,
         sleep: SleepFn = asyncio.sleep,
+        memory_store: TargetMemoryStore | None = None,
+        story_clock: StoryClock | None = None,
+        renderer: Any | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -89,6 +103,9 @@ class Orchestrator:
         self.agents = agents
         self.aggressive = aggressive
         self._sleep = sleep
+        self.memory_store = memory_store or TargetMemoryStore(state.store.db_path.parent)
+        self.story_clock = story_clock or StoryClock()
+        self._renderer = renderer
 
         min_gap = (
             config.aggressive.pacing.min_gap_s
@@ -103,12 +120,85 @@ class Orchestrator:
         self._consecutive_rejections: int = 0
         self._consecutive_msg_failures: int = 0
         self._last_signal_payload: dict[str, Any] | None = None
+        self._channels_catalog: list[dict[str, Any]] = []
+        self._channels_by_id: dict[str, dict[str, Any]] = {}
+        self._target_memory: TargetMemory | None = None
+        self._visual_proof_asset_id: str | None = None
         self._campaign_memory: dict[str, Any] = {
             "registered_urls": [],
             "mentioned_urls": [],
             "mentioned_dates": [],
             "subjects": [],
         }
+
+    def _sync_story_clock(self, iso_ts: str | None) -> None:
+        """Advance the monotonic StoryClock forward if a remote story_time is ahead."""
+        if not iso_ts:
+            return
+        try:
+            remote_dt = datetime.fromisoformat(iso_ts)
+        except ValueError:
+            return
+        if remote_dt.tzinfo is None:
+            remote_dt = remote_dt.replace(tzinfo=self.story_clock.tz)
+        else:
+            remote_dt = remote_dt.astimezone(self.story_clock.tz)
+        current_dt = datetime.fromisoformat(self.story_clock.current_iso)
+        if remote_dt >= current_dt:
+            self.story_clock._current = (remote_dt + timedelta(seconds=1)).replace(microsecond=0)
+
+    async def _recover_story_time(self, session_id: str) -> str:
+        """Query remote session story_time after a 409 StoryTimeError and advance monotonically."""
+        try:
+            remote = await self.api.get_session(session_id)
+            remote_st = remote.get("story_time")
+            if isinstance(remote_st, str) and remote_st:
+                self._sync_story_clock(remote_st)
+        except TargetAPIError:
+            pass
+        return self.story_clock.advance_message(minutes=5)
+
+    async def _load_channels_catalog(self) -> None:
+        if self._channels_catalog:
+            return
+        try:
+            channels = await self.api.get_channels()
+        except TargetAPIError:
+            return
+        self._channels_catalog = channels
+        self._channels_by_id = {
+            str(ch.get("id") or ch.get("channel")): ch
+            for ch in channels
+            if isinstance(ch, dict) and (ch.get("id") or ch.get("channel"))
+        }
+
+    def _strategy_context_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "current_story_time": self.story_clock.current_iso,
+        }
+        if self._channels_catalog:
+            kwargs["available_channels"] = self._channels_catalog
+        if self._target_memory is not None and self._target_memory.sessions_seen > 0:
+            kwargs["target_memory"] = self._target_memory.to_strategy_context()
+        return kwargs
+
+    async def _reconcile_resumed_session(self) -> None:
+        session_id = self.snapshot.sessions.current
+        if not session_id:
+            return
+        try:
+            remote = await self.api.get_session(session_id)
+        except TargetAPIError:
+            return
+        remote_st = remote.get("story_time")
+        if isinstance(remote_st, str) and remote_st:
+            self._sync_story_clock(remote_st)
+        remote_events: list[dict[str, Any]] = []
+        try:
+            remote_events = await self.api.get_session_events(session_id)
+        except TargetAPIError:
+            pass
+        self.state.reconcile_remote_session(remote, remote_events)
 
     def _record_campaign_memory(
         self,
@@ -315,12 +405,25 @@ class Orchestrator:
                 session_max_touches=touch_budget,
                 sessions_allowed=max_sessions,
             )
+            await self._load_channels_catalog()
+            self._target_memory = self.memory_store.load(self.config.run.scenario, target.id)
+            if self._target_memory.sessions_seen > 0:
+                self.state.seed_from_memory(self._target_memory)
             sess_res = await self.api.create_session(self.config.run.scenario)
             session_id = str(sess_res.get("session_id") or sess_res.get("id") or "")
             if not session_id:
                 raise TargetAPIError(500, f"create_session response missing session_id: {sess_res}")
+            remote_st = sess_res.get("story_time")
+            if isinstance(remote_st, str) and remote_st:
+                self._sync_story_clock(remote_st)
             self.state.start_session(session_id, session_max_touches=touch_budget)
             self.state.transition_state("RESEARCH", reason="session created; starting bootstrap")
+        else:
+            await self._load_channels_catalog()
+            if self._target_memory is None and self.snapshot.target.id:
+                self._target_memory = self.memory_store.load(
+                    self.snapshot.run.scenario, self.snapshot.target.id
+                )
 
         # Parallel OSINT + Identity bootstrap
         osint_task = self._safe_run_agent("osint", self.agents.osint, mode="bootstrap")
@@ -349,7 +452,12 @@ class Orchestrator:
             self.policy.mark_profile_ran()
 
         # Initial strategy plan
-        strategy_prop = await self._safe_run_agent("strategy", self.agents.strategy, mode="plan")
+        strategy_prop = await self._safe_run_agent(
+            "strategy",
+            self.agents.strategy,
+            mode="plan",
+            **self._strategy_context_kwargs(),
+        )
         if strategy_prop is not None:
             actions.extend(self._actions_from_commits([self.state.commit_proposal(strategy_prop)]))
 
@@ -404,6 +512,7 @@ class Orchestrator:
         expected_url: str | None = None,
         landing_page_spec: dict[str, Any] | None = None,
         render_prefix: str = "artifact",
+        email_style: str | None = None,
     ) -> tuple[str, QAVerdict | None, bool]:
         if self.agents.qa is None:
             return html_or_body, None, False
@@ -421,12 +530,14 @@ class Orchestrator:
                 channel=channel,
                 html=current_content,
                 is_landing_page=is_landing_page,
+                email_style=email_style,
                 revision=revision,
                 revision_cycle=revision,
                 asset_map=asset_map or None,
                 page_url=page_url,
                 expected_url=expected_url,
                 landing_page_spec=landing_page_spec,
+                reference_date=self.story_clock.current_iso[:10],
                 save_screenshot_path=screenshot_path,
             )
             if qa_prop is None:
@@ -463,36 +574,18 @@ class Orchestrator:
 
         return current_content, last_verdict, _has_rule_violation(last_verdict)
 
-    async def _ensure_landing_page_registered(
+    async def _register_single_page(
         self,
+        spec: LandingPageSpec,
+        *,
+        session_id: str,
         next_touch_n: int,
         actions: list[DecisionAction],
+        force: bool = False,
     ) -> str | None:
-        plan = self.snapshot.campaign.plan
-        session_id = self.snapshot.sessions.current
-        if plan is None or plan.landing_page is None or not session_id:
-            return None
-
-        spec = plan.landing_page
         page_url = self._build_landing_page_url(spec.url_path)
-        if self.api.is_page_registered(session_id, page_url):
+        if not force and self.api.is_page_registered(session_id, page_url):
             return page_url
-
-        if next_touch_n < spec.trigger_touch:
-            last_in = next(
-                (t for t in reversed(self.snapshot.conversation.turns) if t.dir == "in"),
-                None,
-            )
-            asked_for_url = bool(
-                last_in is not None
-                and re.search(
-                    r"\b(?:url|link|website|web\s*page|event\s+page|landing\s+page|registration\s+page|portal)\b",
-                    last_in.body,
-                    re.IGNORECASE,
-                )
-            )
-            if not asked_for_url:
-                return None
 
         title = spec.pretext or "Verification Portal"
         fields = list(spec.fields) if spec.fields else ["email", "password"]
@@ -558,10 +651,106 @@ class Orchestrator:
             title=title,
             html=html,
             fields=fields,
+            force=force,
         )
         self._record_campaign_memory(registered_url=page_url)
         actions.append(_action("register_page", url=page_url, title=title, fields=fields))
         return page_url
+
+    async def _ensure_landing_page_registered(
+        self,
+        next_touch_n: int,
+        actions: list[DecisionAction],
+    ) -> str | None:
+        plan = self.snapshot.campaign.plan
+        session_id = self.snapshot.sessions.current
+        if plan is None or not session_id:
+            return None
+
+        specs: list[LandingPageSpec] = []
+        if plan.landing_page is not None:
+            specs.append(plan.landing_page)
+        specs.extend(plan.pages)
+        if not specs:
+            return None
+
+        last_in = next(
+            (t for t in reversed(self.snapshot.conversation.turns) if t.dir == "in"),
+            None,
+        )
+        asked_for_url = bool(
+            last_in is not None
+            and re.search(
+                r"\b(?:url|link|website|web\s*page|event\s+page|landing\s+page|registration\s+page|portal)\b",
+                last_in.body,
+                re.IGNORECASE,
+            )
+        )
+
+        existing_by_url = {
+            p.url: p for p in self.state.store.get_pages_for_session(session_id)
+        }
+        chosen_url: str | None = None
+        for spec in specs:
+            url = self._build_landing_page_url(spec.url_path)
+            existing = existing_by_url.get(url)
+            fields_changed = (
+                existing is not None
+                and bool(spec.fields)
+                and {f.lower() for f in spec.fields} != {f.lower() for f in existing.fields}
+            )
+
+            if existing is not None and not fields_changed:
+                if next_touch_n >= spec.trigger_touch or asked_for_url:
+                    chosen_url = url
+                continue
+
+            if next_touch_n < spec.trigger_touch and not asked_for_url:
+                continue
+
+            registered = await self._register_single_page(
+                spec,
+                session_id=session_id,
+                next_touch_n=next_touch_n,
+                actions=actions,
+                force=fields_changed,
+            )
+            if registered:
+                chosen_url = registered
+
+        return chosen_url
+
+    async def _maybe_upload_visual_proof(self, touch_spec: TouchSpec) -> str | None:
+        """Render and upload an on-demand PNG briefing sheet when renderer is available."""
+        if (
+            self._renderer is None
+            or self._visual_proof_asset_id is not None
+            or self.snapshot.identity is None
+            or touch_spec.escalation < 2
+            or touch_spec.channel not in {"email", "shared_document", "linkedin_message"}
+        ):
+            return self._visual_proof_asset_id
+        plan = self.snapshot.campaign.plan
+        if plan is None or plan.objective not in {"credentials", "disclosure"}:
+            return None
+        bullets = [h.topic for h in self.snapshot.hooks if h.status != "exhausted"][:3]
+        if not bullets:
+            return None
+        out_path = self.config.run.data_dir / "renders" / f"{self.snapshot.target.id}_brief.png"
+        try:
+            await render_visual_artifact_png(
+                self._renderer,
+                title=self.snapshot.identity.company or "Program Brief",
+                subtitle=touch_spec.intent,
+                bullets=bullets,
+                manifest=self.snapshot.identity,
+                out_path=out_path,
+            )
+            record = await self.api.upload_asset(out_path)
+            self._visual_proof_asset_id = record.asset_id
+            return record.asset_id
+        except Exception:  # noqa: BLE001
+            return None
 
     def _sender_dict(
         self,
@@ -622,6 +811,7 @@ class Orchestrator:
             return False
 
         self.policy.reset_for_new_session()
+        self.story_clock = StoryClock()
         self._last_signal_payload = None
         self.state.start_session(new_sid)
         actions.append(
@@ -638,10 +828,235 @@ class Orchestrator:
             mode="plan",
             reason="fresh session started",
             campaign_memory=dict(self._campaign_memory),
+            **self._strategy_context_kwargs(),
         )
         if replan is not None:
             actions.extend(self._actions_from_commits([self.state.commit_proposal(replan)]))
         return True
+
+    async def _execute_live_conversation(
+        self,
+        *,
+        session_id: str,
+        channel: Channel,
+        touch_spec: TouchSpec,
+        initial_msg_prop: Proposal,
+        initial_body: str,
+        initial_attachments: list[str | dict[str, Any]] | None,
+        initial_facts_used: list[str],
+        sender_obj: dict[str, str] | None,
+        sent_at: str,
+        registered_url: str | None,
+        session_registered_urls: list[str],
+        actions: list[DecisionAction],
+    ) -> tuple[list[Event], list[dict[str, Any]], bool]:
+        """Run an interactive multi-turn live conversation (1 touch for up to 10 turns)."""
+        recorded_events: list[Event] = []
+        call_transcript: list[dict[str, Any]] = []
+        idempotency_key = str(uuid4())
+
+        # Start conversation (bills 1 touch on Target API)
+        start_sent_at = sent_at
+        try:
+            conv_res = await self.api.start_conversation(
+                session_id,
+                to=self.snapshot.target.id,
+                channel=channel,
+                sender=sender_obj,
+                sent_at=start_sent_at,
+                idempotency_key=idempotency_key,
+            )
+        except StoryTimeError:
+            start_sent_at = await self._recover_story_time(session_id)
+            conv_res = await self.api.start_conversation(
+                session_id,
+                to=self.snapshot.target.id,
+                channel=channel,
+                sender=sender_obj,
+                sent_at=start_sent_at,
+                idempotency_key=str(uuid4()),
+            )
+
+        cid = str(conv_res.get("conversation_id") or conv_res.get("id") or "")
+        if not cid:
+            raise TargetAPIError(500, f"start_conversation missing id: {conv_res}")
+        self._active_conversations[channel] = cid
+
+        # Record opening persona greeting if returned
+        last_persona_says = str(conv_res.get("persona_says") or "").strip()
+        if last_persona_says:
+            greeting_ev = self.state.record_target_event(
+                {
+                    "type": "persona_says",
+                    "channel": channel,
+                    "body": last_persona_says,
+                    "conversation_id": cid,
+                    "turn": 0,
+                },
+                default_channel=channel,
+            )
+            recorded_events.append(greeting_ev)
+            call_transcript.append({"speaker": "target", "turn": 0, "text": last_persona_says})
+
+        for raw_ev in conv_res.get("events", []) or []:
+            if isinstance(raw_ev, dict):
+                recorded_events.append(self.state.record_target_event(raw_ev, default_channel=channel))
+
+        touch_billed = False
+        registered_pages = self.state.store.get_pages_for_session(session_id)
+
+        try:
+            for turn_idx in range(1, MAX_CONVERSATION_TURNS + 1):
+                turn_sent_at = self.story_clock.advance_turn(seconds=25)
+                if turn_idx == 1:
+                    say_text = initial_body
+                    turn_attachments = initial_attachments
+                    turn_facts = initial_facts_used
+                    hang_up = bool(initial_msg_prop.payload.get("hang_up", False))
+                    prop_id = initial_msg_prop.proposal_id
+                else:
+                    turn_prop = await self._safe_run_agent(
+                        "messaging",
+                        self.agents.messaging,
+                        mode="live_turn",
+                        channel=channel,
+                        touch=touch_spec.model_dump(mode="json"),
+                        persona_says=last_persona_says,
+                        turn_index=turn_idx,
+                        current_story_time=turn_sent_at,
+                        sent_at=turn_sent_at,
+                        registered_page_url=registered_url,
+                        known_registered_urls=session_registered_urls,
+                        channel_info=self._channels_by_id.get(channel),
+                        sender_alias=touch_spec.sender_alias,
+                        campaign_memory=dict(self._campaign_memory),
+                        latest_signal=self._last_signal_payload,
+                    )
+                    if turn_prop is None:
+                        break
+                    say_text = str(
+                        turn_prop.payload.get("say") or turn_prop.payload.get("body") or ""
+                    ).strip()
+                    if not say_text:
+                        break
+                    turn_attachments = turn_prop.payload.get("attachments") or None
+                    turn_facts = [str(f) for f in turn_prop.payload.get("facts_used", [])]
+                    hang_up = bool(turn_prop.payload.get("hang_up", False))
+                    prop_id = turn_prop.proposal_id
+
+                try:
+                    turn_res = await self.api.send_conversation_turn(
+                        cid,
+                        say_text,
+                        attachments=turn_attachments,
+                        sent_at=turn_sent_at,
+                        idempotency_key=str(uuid4()),
+                    )
+                except StoryTimeError:
+                    turn_sent_at = await self._recover_story_time(session_id)
+                    turn_res = await self.api.send_conversation_turn(
+                        cid,
+                        say_text,
+                        attachments=turn_attachments,
+                        sent_at=turn_sent_at,
+                        idempotency_key=str(uuid4()),
+                    )
+                except ConversationEndedError:
+                    break
+
+                self.state.record_outbound_turn(
+                    channel=channel,
+                    body=say_text,
+                    subject=None,
+                    idempotency_key=idempotency_key if not touch_billed else str(uuid4()),
+                    facts_used=turn_facts,
+                    attachments=turn_attachments,
+                    cost_touch=not touch_billed,
+                )
+                if not touch_billed:
+                    touch_billed = True
+                    actions.append(
+                        _action(
+                            "send",
+                            proposal_id=prop_id,
+                            channel=channel,
+                            idempotency_key=idempotency_key,
+                            touch_n=self.snapshot.campaign.budget.used,
+                            conversation_id=cid,
+                        )
+                    )
+                call_transcript.append({"speaker": "sender", "turn": turn_idx, "text": say_text})
+
+                reply_text = str(turn_res.get("persona_says") or "").strip()
+                if reply_text:
+                    last_persona_says = reply_text
+                    reply_ev = self.state.record_target_event(
+                        {
+                            "type": "persona_says",
+                            "channel": channel,
+                            "body": reply_text,
+                            "conversation_id": cid,
+                            "turn": turn_idx,
+                        },
+                        default_channel=channel,
+                    )
+                    recorded_events.append(reply_ev)
+                    call_transcript.append({"speaker": "target", "turn": turn_idx, "text": reply_text})
+
+                turn_events = turn_res.get("events", [])
+                if isinstance(turn_events, list):
+                    for raw_ev in turn_events:
+                        if isinstance(raw_ev, dict):
+                            recorded_events.append(
+                                self.state.record_target_event(raw_ev, default_channel=channel)
+                            )
+
+                # Immediate win check on events emitted during this call turn
+                win = evaluate_wins(
+                    recorded_events,
+                    plan=self.snapshot.campaign.plan,
+                    registered_pages=registered_pages,
+                )
+                if win is not None:
+                    self.state.record_incident(
+                        objective=win.objective,
+                        evidence_event_ids=win.evidence_event_ids,
+                        summary=win.summary,
+                        details=win.details,
+                    )
+                    actions.append(
+                        _action(
+                            "declare_incident",
+                            objective=win.objective,
+                            evidence=win.evidence_event_ids,
+                            summary=win.summary,
+                        )
+                    )
+                    self.state.log_decision(
+                        DecisionRecord(
+                            trigger="target_event",
+                            snapshot_version=self.snapshot.version,
+                            actions=actions,
+                            notes=f"Objective achieved during live {channel} ({win.objective}): {win.summary}",
+                        )
+                    )
+                    return recorded_events, call_transcript, True
+
+                if bool(turn_res.get("ended")) or hang_up:
+                    break
+        finally:
+            if not touch_billed:
+                # start_conversation consumed 1 touch even if turn 1 failed immediately
+                self.snapshot.campaign.budget.used += 1
+                self.state.store.save_snapshot(self.snapshot)
+            try:
+                await self.api.end_conversation(cid)
+            except TargetAPIError:
+                pass
+            if self._active_conversations.get(channel) == cid:
+                self._active_conversations.pop(channel, None)
+
+        return recorded_events, call_transcript, False
 
     # --- Single Campaign Cycle ---
 
@@ -692,6 +1107,8 @@ class Orchestrator:
                 self.agents.strategy,
                 mode="plan",
                 reason=plan_reason,
+                campaign_memory=dict(self._campaign_memory),
+                **self._strategy_context_kwargs(),
             )
             if plan_prop is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(plan_prop)]))
@@ -699,6 +1116,13 @@ class Orchestrator:
         touch_spec = self._next_touch_spec()
         registered_url = await self._ensure_landing_page_registered(touch_spec.n, actions)
         session_registered_urls = [p.url for p in self.state.store.get_pages_for_session(session_id)]
+        await self._maybe_upload_visual_proof(touch_spec)
+
+        # Advance monotonic story time for this contact
+        planned_delay = touch_spec.story_delay_minutes if touch_spec.story_delay_minutes else 95
+        contact_sent_at = self.story_clock.advance_message(minutes=planned_delay)
+        active_plan = self.snapshot.campaign.plan
+        channel_info = self._channels_by_id.get(touch_spec.channel)
 
         # Compose message (use live_turn mode for live voice/chat channels)
         compose_mode = "live_turn" if self.policy.is_live_channel(touch_spec.channel) else "compose"
@@ -712,6 +1136,13 @@ class Orchestrator:
             known_registered_urls=session_registered_urls,
             campaign_memory=dict(self._campaign_memory),
             latest_signal=self._last_signal_payload,
+            sent_at=contact_sent_at,
+            current_story_time=contact_sent_at,
+            channel_info=channel_info,
+            email_style=touch_spec.email_style,
+            sender_alias=touch_spec.sender_alias,
+            action_artifact=active_plan.action_artifact if active_plan else None,
+            objective=active_plan.objective if active_plan else None,
         )
         if msg_prop is None:
             self._consecutive_msg_failures += 1
@@ -758,6 +1189,13 @@ class Orchestrator:
                     known_registered_urls=session_registered_urls,
                     campaign_memory=dict(self._campaign_memory),
                     latest_signal=self._last_signal_payload,
+                    sent_at=contact_sent_at,
+                    current_story_time=contact_sent_at,
+                    channel_info=channel_info,
+                    email_style=touch_spec.email_style,
+                    sender_alias=touch_spec.sender_alias,
+                    action_artifact=active_plan.action_artifact if active_plan else None,
+                    objective=active_plan.objective if active_plan else None,
                     qa_feedback=verdict.model_dump(mode="json", by_alias=True),
                 )
                 if rev is None:
@@ -777,6 +1215,8 @@ class Orchestrator:
                 revise_fn=_revise_msg,
                 expected_url=registered_url,
                 render_prefix=f"{session_id}_t{touch_spec.n}",
+                email_style=str(msg_prop.payload.get("email_style") or touch_spec.email_style or "")
+                or None,
             )
             if blocked_by_rule:
                 reason = (
@@ -826,6 +1266,14 @@ class Orchestrator:
                 channel=touch_spec.channel,
                 touch=touch_spec.model_dump(mode="json"),
                 registered_page_url=registered_url,
+                known_registered_urls=session_registered_urls,
+                sent_at=contact_sent_at,
+                current_story_time=contact_sent_at,
+                channel_info=channel_info,
+                email_style=touch_spec.email_style,
+                sender_alias=touch_spec.sender_alias,
+                action_artifact=active_plan.action_artifact if active_plan else None,
+                objective=active_plan.objective if active_plan else None,
                 latest_signal=self._last_signal_payload,
                 rejection_feedback=reject_reason,
             )
@@ -866,70 +1314,124 @@ class Orchestrator:
         self._record_campaign_memory(body=body, subject=subject)
         attachments = msg_prop.payload.get("attachments") or None
         sent_at_raw = msg_prop.payload.get("sent_at")
-        sent_at = str(sent_at_raw) if sent_at_raw else None
+        sent_at = str(sent_at_raw) if sent_at_raw else contact_sent_at
         sender_obj = self._sender_dict(channel=channel, msg_payload=msg_prop.payload)
         facts_used = [str(f) for f in msg_prop.payload.get("facts_used", [])]
         page_request = msg_prop.payload.get("page_request")
         required_page_url = (
             self._build_landing_page_url(str(page_request)) if page_request else None
         )
-        if (
-            required_page_url is None
-            and self.snapshot.campaign.plan is not None
-            and self.snapshot.campaign.plan.landing_page is not None
-        ):
-            planned_url = self._build_landing_page_url(self.snapshot.campaign.plan.landing_page.url_path)
-            if planned_url in body:
-                required_page_url = planned_url
+        if required_page_url is None and self.snapshot.campaign.plan is not None:
+            candidate_specs = [
+                *(
+                    [self.snapshot.campaign.plan.landing_page]
+                    if self.snapshot.campaign.plan.landing_page is not None
+                    else []
+                ),
+                *self.snapshot.campaign.plan.pages,
+            ]
+            for page_spec in candidate_specs:
+                planned_url = self._build_landing_page_url(page_spec.url_path)
+                if planned_url in body:
+                    required_page_url = planned_url
+                    break
         idempotency_key = str(uuid4())
 
-        # Execute send via Target API
+        # Execute send via Target API (live conversation loop OR async message)
         api_t0 = time.monotonic()
         api_step_id = uuid4().hex[:8]
         self.state.record_stage_start("target_api", mode=channel, step_id=api_step_id)
+        recorded_events: list[Event] = []
+        call_transcript: list[dict[str, Any]] = []
         try:
             if self.policy.is_live_channel(channel):
-                cid = self._active_conversations.get(channel)
-                if cid is None:
-                    conv_res = await self.api.start_conversation(
+                recorded_events, call_transcript, won_in_call = await self._execute_live_conversation(
+                    session_id=session_id,
+                    channel=channel,
+                    touch_spec=touch_spec,
+                    initial_msg_prop=msg_prop,
+                    initial_body=body,
+                    initial_attachments=attachments,
+                    initial_facts_used=facts_used,
+                    sender_obj=sender_obj,
+                    sent_at=sent_at,
+                    registered_url=registered_url,
+                    session_registered_urls=session_registered_urls,
+                    actions=actions,
+                )
+                self.state.record_stage_timing(
+                    "target_api",
+                    elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                    ok=True,
+                    mode=channel,
+                    step_id=api_step_id,
+                )
+                if won_in_call:
+                    return self.snapshot
+            else:
+                try:
+                    api_res = await self.api.send_message(
                         session_id,
                         to=self.snapshot.target.id,
                         channel=channel,
+                        body=body,
                         sender=sender_obj,
+                        subject=subject,
+                        attachments=attachments,
                         sent_at=sent_at,
+                        required_page_url=required_page_url,
                         idempotency_key=idempotency_key,
                     )
-                    cid = str(conv_res.get("conversation_id") or conv_res.get("id") or "")
-                    if not cid:
-                        raise TargetAPIError(500, f"start_conversation missing id: {conv_res}")
-                    self._active_conversations[channel] = cid
-                api_res = await self.api.send_conversation_turn(
-                    cid,
-                    body,
-                    attachments=attachments,
-                    sent_at=sent_at,
-                    idempotency_key=str(uuid4()),
+                except StoryTimeError:
+                    sent_at = await self._recover_story_time(session_id)
+                    api_res = await self.api.send_message(
+                        session_id,
+                        to=self.snapshot.target.id,
+                        channel=channel,
+                        body=body,
+                        sender=sender_obj,
+                        subject=subject,
+                        attachments=attachments,
+                        sent_at=sent_at,
+                        required_page_url=required_page_url,
+                        idempotency_key=str(uuid4()),
+                    )
+                self.state.record_stage_timing(
+                    "target_api",
+                    elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                    ok=True,
+                    mode=channel,
+                    step_id=api_step_id,
                 )
-            else:
-                api_res = await self.api.send_message(
-                    session_id,
-                    to=self.snapshot.target.id,
+
+                # Record outbound touch & returned target events
+                self.state.record_outbound_turn(
                     channel=channel,
                     body=body,
-                    sender=sender_obj,
                     subject=subject,
-                    attachments=attachments,
-                    sent_at=sent_at,
-                    required_page_url=required_page_url,
                     idempotency_key=idempotency_key,
+                    facts_used=facts_used,
+                    attachments=attachments,
+                    cost_touch=True,
                 )
-            self.state.record_stage_timing(
-                "target_api",
-                elapsed_ms=int((time.monotonic() - api_t0) * 1000),
-                ok=True,
-                mode=channel,
-                step_id=api_step_id,
-            )
+                actions.append(
+                    _action(
+                        "send",
+                        proposal_id=msg_prop.proposal_id,
+                        channel=channel,
+                        idempotency_key=idempotency_key,
+                        touch_n=self.snapshot.campaign.budget.used,
+                    )
+                )
+
+                raw_events = api_res.get("events", [])
+                if not isinstance(raw_events, list):
+                    raw_events = []
+                recorded_events = [
+                    self.state.record_target_event(ev, default_channel=channel)
+                    for ev in raw_events
+                    if isinstance(ev, dict)
+                ]
         except BudgetExhaustedError as exc:
             self.state.record_stage_timing(
                 "target_api",
@@ -970,6 +1472,8 @@ class Orchestrator:
                 self.agents.strategy,
                 mode="pivot",
                 reason=f"422 rejection on channel {channel}: {exc.detail}",
+                campaign_memory=dict(self._campaign_memory),
+                **self._strategy_context_kwargs(),
             )
             if replan is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(replan)]))
@@ -1001,36 +1505,9 @@ class Orchestrator:
             )
             return self.snapshot
 
-        # Record outbound touch & returned target events
-        self.state.record_outbound_turn(
-            channel=channel,
-            body=body,
-            subject=subject,
-            idempotency_key=idempotency_key,
-            facts_used=facts_used,
-            attachments=attachments,
-            cost_touch=True,
+        had_reply = any(
+            e.payload.get("event") in {"reply", "persona_says"} for e in recorded_events
         )
-        actions.append(
-            _action(
-                "send",
-                proposal_id=msg_prop.proposal_id,
-                channel=channel,
-                idempotency_key=idempotency_key,
-                touch_n=self.snapshot.campaign.budget.used,
-            )
-        )
-
-        raw_events = api_res.get("events", [])
-        if not isinstance(raw_events, list):
-            raw_events = []
-        recorded_events: list[Event] = [
-            self.state.record_target_event(ev, default_channel=channel)
-            for ev in raw_events
-            if isinstance(ev, dict)
-        ]
-
-        had_reply = any(e.payload.get("event") == "reply" for e in recorded_events)
         self.policy.record_touch_sent(
             channel,
             had_reply=had_reply,
@@ -1069,25 +1546,61 @@ class Orchestrator:
             )
             return self.snapshot
 
-        # Signal extraction on replies
+        # Classify non-credential page submissions & intermediate step events (link/attachment opens)
+        page_submissions: list[str] = []
         for ev in recorded_events:
-            if ev.payload.get("event") == "reply":
-                sig_prop = await self._safe_run_agent(
-                    "messaging",
-                    self.agents.messaging,
-                    mode="signal",
-                    event=ev.model_dump(mode="json"),
+            ev_kind = str(ev.payload.get("event") or "").strip().lower()
+            if ev_kind in {"link.opened", "attachment.opened"}:
+                # Recorded as a positive step/momentum signal, NOT a terminal incident
+                boosted_susp = max(0.0, self.policy.state.last_suspicion - 0.10)
+                self.policy.record_signal(
+                    engagement=max(0.70, self.policy.state.last_engagement),
+                    suspicion=boosted_susp,
                 )
-                if sig_prop is not None:
-                    self.state.commit_proposal(sig_prop)
-                    self._last_signal_payload = dict(sig_prop.payload)
-                    engagement = float(sig_prop.payload.get("engagement", 0.5))
-                    suspicion = float(sig_prop.payload.get("suspicion", 0.0))
-                    self.policy.record_signal(engagement=engagement, suspicion=suspicion)
+                continue
+            sub_class = classify_page_submission(ev, registered_pages)
+            if sub_class == "disclosure_candidate":
+                summary = extract_page_submission_summary(ev)
+                if summary:
+                    page_submissions.append(summary)
+            elif sub_class == "step_up":
+                summary = extract_page_submission_summary(ev)
+                if summary:
+                    page_submissions.append(summary)
+                boosted_susp = max(0.0, self.policy.state.last_suspicion - 0.15)
+                self.policy.record_signal(engagement=0.75, suspicion=boosted_susp)
 
-        # Profile update (batched every >=2 target events, or on every reply for opportunistic disclosure wins)
+        # Signal extraction on replies (or final persona utterance for a live conversation)
+        signal_events = [e for e in recorded_events if e.payload.get("event") == "reply"]
+        if not signal_events:
+            persona_evs = [
+                e for e in recorded_events if e.payload.get("event") == "persona_says"
+            ]
+            if persona_evs:
+                signal_events = [persona_evs[-1]]
+        for ev in signal_events:
+            sig_prop = await self._safe_run_agent(
+                "messaging",
+                self.agents.messaging,
+                mode="signal",
+                event=ev.model_dump(mode="json"),
+            )
+            if sig_prop is not None:
+                self.state.commit_proposal(sig_prop)
+                self._last_signal_payload = dict(sig_prop.payload)
+                engagement = float(sig_prop.payload.get("engagement", 0.5))
+                suspicion = float(sig_prop.payload.get("suspicion", 0.0))
+                self.policy.record_signal(engagement=engagement, suspicion=suspicion)
+
+        # Profile update (batched, on reply/call transcript, or on page submission)
         disclosure_candidates: list[dict[str, Any]] | None = None
-        should_profile = self.policy.should_trigger_profile() or had_reply
+        action_candidates: list[dict[str, Any]] | None = None
+        should_profile = (
+            self.policy.should_trigger_profile()
+            or had_reply
+            or bool(page_submissions)
+            or bool(call_transcript)
+        )
         if should_profile and self.agents.profile is not None:
             actions.append(_action("trigger", agent="profile", reason="target event batch"))
             prof_prop = await self._safe_run_agent(
@@ -1098,6 +1611,8 @@ class Orchestrator:
                 recent_signals=(
                     [self._last_signal_payload] if self._last_signal_payload is not None else None
                 ),
+                page_submissions=page_submissions or None,
+                call_transcript=call_transcript or None,
             )
             if prof_prop is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(prof_prop)]))
@@ -1107,13 +1622,19 @@ class Orchestrator:
                 )
                 if isinstance(raw_disc, list):
                     disclosure_candidates = [d for d in raw_disc if isinstance(d, dict)]
+                raw_act = prof_prop.payload.get("action_candidates") or prof_prop.payload.get(
+                    "actions_taken"
+                )
+                if isinstance(raw_act, list):
+                    action_candidates = [a for a in raw_act if isinstance(a, dict)]
 
-        # Check disclosure win
+        # Check disclosure / committed action win
         disc_win = evaluate_wins(
             [],
             plan=self.snapshot.campaign.plan,
             registered_pages=registered_pages,
             disclosure_candidates=disclosure_candidates,
+            action_candidates=action_candidates,
         )
         if disc_win is not None:
             self.state.record_incident(
@@ -1164,6 +1685,7 @@ class Orchestrator:
                 mode="pivot",
                 reason=pivot_reason,
                 campaign_memory=dict(self._campaign_memory),
+                **self._strategy_context_kwargs(),
             )
             self.policy.mark_strategy_pivoted()
             if strat_prop is not None:
@@ -1193,6 +1715,13 @@ class Orchestrator:
         try:
             if self.snapshot.run.state == "BOOT":
                 await self.bootstrap()
+            else:
+                await self._load_channels_catalog()
+                await self._reconcile_resumed_session()
+                if self._target_memory is None and self.snapshot.target.id:
+                    self._target_memory = self.memory_store.load(
+                        self.snapshot.run.scenario, self.snapshot.target.id
+                    )
 
             cycles = 0
             while self.snapshot.run.state not in {"WIN", "ABORT", "DONE"} and cycles < max_cycles:
@@ -1203,10 +1732,28 @@ class Orchestrator:
                 exit_reason = "completed"
             elif cycles >= max_cycles:
                 exit_reason = "cycle_limit"
+        except asyncio.CancelledError:
+            exit_reason = "stopped"
+            raise
         except Exception:
             exit_reason = "service_failure"
             raise
         finally:
             await self._close_active_conversations()
+            if (
+                self.snapshot.run.state in {"WIN", "DONE"}
+                and self.snapshot.sessions.current
+            ):
+                try:
+                    await self.api.end_session(self.snapshot.sessions.current)
+                except TargetAPIError:
+                    pass
+            if self.snapshot.run.state != "BOOT" and (
+                self.snapshot.target.id or self.snapshot.run.target_id
+            ):
+                try:
+                    self.memory_store.update_from_snapshot(self.snapshot)
+                except Exception as exc:  # noqa: BLE001
+                    self.state.record_system_error("memory", f"TargetMemory save skipped: {exc}")
             self.state.record_run_exit(exit_reason)
         return self.snapshot

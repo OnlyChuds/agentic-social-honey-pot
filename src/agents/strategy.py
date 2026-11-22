@@ -101,25 +101,35 @@ def validate_campaign_plan(
                 f"already-seen escalation {min_escalation}."
             )
 
+    planned_nums = {t.n for t in plan.touches}
+    all_pages = [*( [plan.landing_page] if plan.landing_page is not None else [] ), *plan.pages]
+
+    for page_idx, page_spec in enumerate(plan.pages):
+        if page_spec.trigger_touch not in planned_nums:
+            errors.append(
+                f"pages[{page_idx}].trigger_touch={page_spec.trigger_touch} "
+                f"must match one of the planned touches {sorted(planned_nums)}."
+            )
+
     if plan.objective == "credentials":
-        if plan.landing_page is None:
-            errors.append("objective='credentials' requires a non-null landing_page spec.")
+        if not all_pages:
+            errors.append("objective='credentials' requires a non-null landing_page or pages entry.")
         else:
-            planned_nums = {t.n for t in plan.touches}
-            if plan.landing_page.trigger_touch not in planned_nums:
-                errors.append(
-                    f"landing_page.trigger_touch={plan.landing_page.trigger_touch} "
-                    f"must match one of the planned touches {sorted(planned_nums)}."
-                )
-            elif len(plan.touches) >= 2 and plan.landing_page.trigger_touch == expected_start:
-                errors.append(
-                    "landing_page.trigger_touch cannot be the very first planned touch "
-                    "(page must be registered in the cycle before linking)."
-                )
-            if not _has_credential_field(plan.landing_page.fields):
+            if plan.landing_page is not None:
+                if plan.landing_page.trigger_touch not in planned_nums:
+                    errors.append(
+                        f"landing_page.trigger_touch={plan.landing_page.trigger_touch} "
+                        f"must match one of the planned touches {sorted(planned_nums)}."
+                    )
+                elif len(plan.touches) >= 2 and plan.landing_page.trigger_touch == expected_start:
+                    errors.append(
+                        "landing_page.trigger_touch cannot be the very first planned touch "
+                        "(page must be registered in the cycle before linking)."
+                    )
+            if not any(_has_credential_field(p.fields) for p in all_pages):
                 errors.append(
                     "objective='credentials' requires credential fields (e.g. ['email', 'password']) "
-                    f"on landing_page.fields; got profile-only fields {plan.landing_page.fields}."
+                    "on landing_page.fields or pages[*].fields."
                 )
 
     return errors
@@ -148,12 +158,27 @@ def _clamp_plan_to_budget(
             touch.hook = fallback_hook
     plan.touches = trimmed
 
-    if plan.landing_page is not None and trimmed:
+    if trimmed:
         valid_nums = [t.n for t in trimmed]
-        if plan.landing_page.trigger_touch not in valid_nums:
-            plan.landing_page.trigger_touch = valid_nums[-1]
-        if plan.objective == "credentials" and not _has_credential_field(plan.landing_page.fields):
-            plan.landing_page.fields = ["email", "password"]
+        if plan.landing_page is not None:
+            if plan.landing_page.trigger_touch not in valid_nums:
+                plan.landing_page.trigger_touch = valid_nums[-1]
+            if (
+                plan.objective == "credentials"
+                and not _has_credential_field(plan.landing_page.fields)
+                and not any(_has_credential_field(p.fields) for p in plan.pages)
+            ):
+                plan.landing_page.fields = ["email", "password"]
+        for page_spec in plan.pages:
+            if page_spec.trigger_touch not in valid_nums:
+                page_spec.trigger_touch = valid_nums[-1]
+        if (
+            plan.objective == "credentials"
+            and plan.landing_page is None
+            and plan.pages
+            and not any(_has_credential_field(p.fields) for p in plan.pages)
+        ):
+            plan.pages[-1].fields = ["email", "password"]
     return plan
 
 
@@ -183,6 +208,9 @@ class StrategyAgent(BaseAgent):
         aggressive: bool = False,
         max_repairs: int = 1,
         campaign_memory: dict[str, Any] | None = None,
+        current_story_time: str | None = None,
+        available_channels: list[dict[str, Any]] | None = None,
+        target_memory: dict[str, Any] | None = None,
         **_extra: Any,
     ) -> Proposal:
         del mode
@@ -256,6 +284,16 @@ class StrategyAgent(BaseAgent):
             h.hook_id for h in ranked_hooks if h.hook_id not in tried_hooks_in_session
         ]
 
+        compact_channels = [
+            {
+                "id": str(ch.get("id") or ch.get("channel") or ""),
+                "kind": str(ch.get("kind") or ch.get("type") or ""),
+                "arrives_as": str(ch.get("arrives_as") or "")[:120],
+            }
+            for ch in (available_channels or [])
+            if isinstance(ch, dict) and (ch.get("id") or ch.get("channel"))
+        ]
+
         context: dict[str, Any] = {
             "run": snapshot.run.model_dump(mode="json"),
             "target": snapshot.target.model_dump(mode="json"),
@@ -286,8 +324,9 @@ class StrategyAgent(BaseAgent):
             "output_keys": [
                 "objective ('credentials' | 'action' | 'disclosure')",
                 "primary_hook (hook_id str)",
-                "touches (list of {n, channel, intent, hook, escalation, stop_if})",
+                "touches (list of {n, channel, intent, hook, escalation, stop_if, email_style?, sender_alias?, story_delay_minutes?})",
                 "landing_page ({pretext, fields, trigger_touch, url_path} or null)",
+                "pages (optional list of additional {pretext, fields, trigger_touch, url_path})",
                 "action_artifact ({filename, purpose} or null)",
                 "pivot_triggers (list[str])",
                 "give_up (str)",
@@ -299,6 +338,12 @@ class StrategyAgent(BaseAgent):
                 "<=6-word stop_if, and <=2 short pivot_triggers."
             ),
         }
+        if current_story_time:
+            context["current_story_time"] = current_story_time
+        if compact_channels:
+            context["available_channels"] = compact_channels
+        if target_memory:
+            context["target_memory"] = target_memory
 
         messages = self.build_messages(context)
         strategy_max_tokens = min(self.prompt.max_tokens, _STRATEGY_MAX_TOKENS)

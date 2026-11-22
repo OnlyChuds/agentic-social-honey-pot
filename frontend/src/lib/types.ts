@@ -347,8 +347,8 @@ export interface TargetDetailResponse {
 
 export interface LaunchRunRequest {
   target_id: string;
-  mode: "mock_stub" | "practice_live";
-  stub_objective: "credentials" | "action" | "disclosure";
+  mode: "practice_live";
+  stub_objective?: "credentials" | "action" | "disclosure";
   zero_pacing: boolean;
   aggressive: boolean;
 }

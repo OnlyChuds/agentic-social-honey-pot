@@ -478,3 +478,44 @@ def test_execution_status_tracks_live_and_completed_stages(tmp_path: Path) -> No
     listed = list_targets(tmp_path, running_run_ids={"practice_julius_run9"})
     assert listed["targets"][0]["active_stage"] == "strategy"
     assert listed["targets"][0]["is_running"] is True
+
+
+@pytest.mark.asyncio
+async def test_stop_endpoint_clears_open_stage_and_cache(tmp_path: Path) -> None:
+    from src.models import RunMeta, Snapshot, TargetInfo
+    from src.orchestrator.state import StateManager
+
+    run_id = "practice_julius_run10"
+    db_path = tmp_path / f"{run_id}.db"
+    with Store(db_path) as store:
+        sm = StateManager(
+            store,
+            Snapshot(
+                version=1,
+                run=RunMeta(scenario="practice", target_id="julius", state="ENGAGE"),
+                target=TargetInfo(id="julius", name="Julius Muth", role="Co-CEO", org="revel8"),
+            ),
+        )
+        sm.record_stage_start("messaging", mode="compose", step_id="s_open")
+
+    manager = RunManager(tmp_path)
+    app = create_app(tmp_path, run_manager=manager)
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            before = await client.get(f"/api/targets/{run_id}")
+            assert before.status_code == 200
+            assert before.json()["summary"]["is_running"] is True
+
+            stop_resp = await client.post(f"/api/runs/{run_id}/stop")
+            assert stop_resp.status_code == 200
+            assert stop_resp.json() == {"run_id": run_id, "stopped": True}
+
+            after = await client.get(f"/api/targets/{run_id}")
+            assert after.status_code == 200
+            payload = after.json()
+            assert payload["summary"]["is_running"] is False
+            assert payload["summary"]["state"] == "DONE"
+            assert payload["execution_status"]["exit_reason"] == "stopped"
+    finally:
+        manager.shutdown()

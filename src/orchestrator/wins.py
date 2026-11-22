@@ -7,6 +7,10 @@ from src.models import CampaignPlan, Event, Objective
 from src.store.db import RegisteredPage
 
 DEFAULT_DISCLOSURE_THRESHOLD = 0.7
+DEFAULT_ACTION_THRESHOLD = 0.75
+_COMMITTED_ACTION_EVENT_TYPES: frozenset[str] = frozenset(
+    {"action.taken", "approval.granted", "access.granted", "payment.changed"}
+)
 
 PageSubmissionClass = Literal["credentials", "disclosure_candidate", "step_up", "none"]
 
@@ -212,45 +216,66 @@ def check_action_win(
     event: Event,
     plan: CampaignPlan | None,
 ) -> WinMatch | None:
-    """Detect an action objective match from an `attachment.opened` target event."""
+    """Detect an explicit action event win (never false-winning on ``attachment.opened`` steps).
+
+    Per updated Target API rules, ``link.opened`` and ``attachment.opened`` are intermediate
+    steps, not incidents. An ``action`` incident requires the target actually executing an
+    action (approving, changing a payment detail, granting access), either via an explicit
+    action event or via ``check_committed_action_win`` from reply/call classification.
+    """
+    del plan
     if event.type != "target_event":
         return None
-    if event.payload.get("event") != "attachment.opened":
+    ev_name = str(event.payload.get("event") or "").strip().lower()
+    if ev_name not in _COMMITTED_ACTION_EVENT_TYPES:
         return None
-    if plan is None or plan.action_artifact is None:
-        return None
-
-    expected_filename = str(plan.action_artifact.get("filename") or "").strip().lower()
-    expected_asset_id = str(plan.action_artifact.get("asset_id") or "").strip().lower()
 
     data = event.payload.get("data")
     data_dict = data if isinstance(data, dict) else {}
-    opened_filename = str(
-        data_dict.get("filename") or event.payload.get("filename") or ""
-    ).strip().lower()
-    opened_asset_id = str(
-        data_dict.get("asset_id") or event.payload.get("asset_id") or ""
-    ).strip().lower()
-
-    matched = (
-        bool(expected_filename and opened_filename == expected_filename)
-        or bool(expected_asset_id and opened_asset_id == expected_asset_id)
-        or (not expected_filename and not expected_asset_id)
-    )
-
-    if not matched:
-        return None
-
-    artifact_label = opened_filename or opened_asset_id or "action_artifact"
+    summary = str(data_dict.get("summary") or event.payload.get("body") or ev_name).strip()
     return WinMatch(
         objective="action",
         evidence_event_ids=[event.event_id],
         confidence=1.0,
-        summary=f"Target opened declared action artifact '{artifact_label}'",
-        details={
-            "filename": opened_filename,
-            "asset_id": opened_asset_id,
-        },
+        summary=f"Target performed requested action ({ev_name}): {summary}",
+        details={"event": ev_name, **data_dict},
+    )
+
+
+def check_committed_action_win(
+    action_candidates: list[dict[str, Any]] | None,
+    *,
+    threshold: float = DEFAULT_ACTION_THRESHOLD,
+) -> WinMatch | None:
+    """Confirm an action objective from profile-classified committed target actions."""
+    if not action_candidates:
+        return None
+
+    best: dict[str, Any] | None = None
+    best_conf = -1.0
+    for cand in action_candidates:
+        if not bool(cand.get("committed")):
+            continue
+        try:
+            conf = float(cand.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if conf >= threshold and conf > best_conf:
+            best = cand
+            best_conf = conf
+
+    if best is None:
+        return None
+
+    evidence_ref = str(best.get("evidence_event") or "").strip()
+    evidence_ids = [evidence_ref] if evidence_ref else []
+    action_desc = str(best.get("action") or "Target executed requested action").strip()
+    return WinMatch(
+        objective="action",
+        evidence_event_ids=evidence_ids,
+        confidence=best_conf,
+        summary=f"Target committed requested action (confidence={best_conf:.2f}): {action_desc}",
+        details=dict(best),
     )
 
 
@@ -303,9 +328,11 @@ def evaluate_wins(
     plan: CampaignPlan | None,
     registered_pages: list[RegisteredPage],
     disclosure_candidates: list[dict[str, Any]] | None = None,
+    action_candidates: list[dict[str, Any]] | None = None,
     disclosure_threshold: float = DEFAULT_DISCLOSURE_THRESHOLD,
+    action_threshold: float = DEFAULT_ACTION_THRESHOLD,
 ) -> WinMatch | None:
-    """Evaluate target events and disclosure candidates against all win conditions."""
+    """Evaluate target events, disclosures, and committed actions against all win conditions."""
     for event in events:
         cred = check_credentials_win(event, registered_pages)
         if cred is not None:
@@ -313,4 +340,7 @@ def evaluate_wins(
         act = check_action_win(event, plan)
         if act is not None:
             return act
+    committed_act = check_committed_action_win(action_candidates, threshold=action_threshold)
+    if committed_act is not None:
+        return committed_act
     return check_disclosure_win(disclosure_candidates, threshold=disclosure_threshold)

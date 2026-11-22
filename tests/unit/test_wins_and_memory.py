@@ -164,6 +164,52 @@ def test_target_memory_store_persists_and_merges_across_sessions(tmp_path: Path)
     assert ctx["top_hooks"][0]["hook_id"] == "h_2"
 
 
+def test_target_memory_store_filters_stub_entries_on_load_and_save(tmp_path: Path) -> None:
+    store = TargetMemoryStore(tmp_path)
+
+    # Pure stub snapshot should never write to disk
+    stub_snap = Snapshot(
+        version=3,
+        run=RunMeta(scenario="practice", target_id="julius", state="WIN"),
+        target=TargetInfo(id="julius", name="Julius Muth", role="Co-CEO", org="revel8"),
+        facts=[
+            Fact(
+                fact_id="f_stub_01",
+                claim="Julius Muth works at revel8",
+                source="https://example.test/profile",
+                provenance="osint",
+                confidence=0.9,
+            )
+        ],
+        hooks=[
+            Hook(
+                hook_id="h_stub_01",
+                topic="upcoming vendor portal migration",
+                evidence=["f_stub_01"],
+                confidence=0.8,
+            )
+        ],
+    )
+    mem_after_stub = store.update_from_snapshot(stub_snap)
+    assert mem_after_stub.sessions_seen == 0
+    assert not store.path_for("practice", "julius").exists()
+
+    # Even if a polluted file already exists on disk, load() strips stub facts and hooks
+    polluted_path = store.path_for("practice", "julius")
+    polluted_path.parent.mkdir(parents=True, exist_ok=True)
+    polluted_path.write_text(
+        '{"scenario":"practice","target_id":"julius","sessions_seen":1,'
+        '"verified_facts":[{"fact_id":"f_stub_01","claim":"stub","source":"https://example.test/p",'
+        '"category":"role","provenance":"osint","confidence":0.9,"status":"active"}],'
+        '"hook_scoreboard":{"h_stub_01":{"hook_id":"h_stub_01","topic":"vendor migration",'
+        '"evidence":["f_stub_01"]}}}',
+        encoding="utf-8",
+    )
+    cleaned = store.load("practice", "julius")
+    assert cleaned.verified_facts == []
+    assert cleaned.hook_scoreboard == {}
+
+
 @pytest.mark.asyncio
 async def test_eval_scout_runs_zero_touch_parallel_osint(tmp_path: Path) -> None:
     mock_state = MockTargetState()
