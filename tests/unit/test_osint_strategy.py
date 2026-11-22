@@ -410,14 +410,14 @@ def test_policy_anti_storm_suspicion_and_no_reply_pivots() -> None:
     policy.mark_strategy_pivoted()
     assert policy.strategy_pivot_reason(snap) is None
 
-    # Consecutive no-reply fires at multiples (2, 4), not every single touch (3)
+    # Consecutive no-reply fires at multiples (2, 4), not every single touch (3) when channel rotates
     policy.record_touch_sent("email", had_reply=False, event_count=0)
     assert policy.strategy_pivot_reason(snap) is None
     policy.record_touch_sent("email", had_reply=False, event_count=0)
     assert policy.strategy_pivot_reason(snap) is not None
-    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    policy.record_touch_sent("linkedin_message", had_reply=False, event_count=0)
     assert policy.strategy_pivot_reason(snap) is None
-    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    policy.record_touch_sent("linkedin_message", had_reply=False, event_count=0)
     assert policy.strategy_pivot_reason(snap) is not None
 
 
@@ -657,3 +657,66 @@ def test_email_auto_linkify_first_name_signoff_and_attachment_guards() -> None:
     cleaned, _warns = enforce_channel_limits(draft)
     assert cleaned.subject == "Re: DACH Summit"
     assert cleaned.attachments == [{"filename": "agenda_march_2027.pdf"}]
+
+
+def test_credentials_page_field_alignment_silence_decay_and_no_attachments() -> None:
+    from src.agents.messaging import _ensure_registered_url_anchored, attachments_disallowed
+    from src.agents.strategy import _clamp_plan_to_budget
+    from src.models import BrandingManifest
+    from src.orchestrator.policy import TriggerPolicy
+
+    # 1) Profile-only fields rejected for credentials objective, clamped to email+password
+    snap = _sample_snapshot(scenario="practice", session_max=8, used=0)
+    bad_cred = CampaignPlan(
+        objective="credentials",
+        primary_hook="h_1",
+        touches=[
+            TouchSpec(n=1, channel="email", intent="opener", hook="h_1", escalation=1),
+            TouchSpec(n=2, channel="email", intent="portal link", hook="h_1", escalation=3),
+        ],
+        landing_page=LandingPageSpec(
+            pretext="Summit registration",
+            fields=["full_name", "work_email", "company", "role", "phone"],
+            trigger_touch=2,
+            url_path="/summit/register",
+        ),
+    )
+    errs = validate_campaign_plan(bad_cred, snap, max_touches=8)
+    assert any("credential fields" in e.lower() for e in errs)
+    clamped = _clamp_plan_to_budget(bad_cred, snap, max_touches=8)
+    assert clamped.landing_page is not None
+    assert clamped.landing_page.fields == ["email", "password"]
+
+    # 2) Silence-decay triggers same-channel pivot after 3 silent emails
+    snap.campaign.plan = clamped
+    policy = TriggerPolicy(min_gap_s=0.0, no_reply_pivot_threshold=4)
+    policy.record_signal(engagement=0.7, suspicion=0.3)
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    policy.record_touch_sent("email", had_reply=False, event_count=0)
+    reason = policy.strategy_pivot_reason(snap)
+    assert reason is not None and "same-channel" in reason
+
+    # 3) Hard-coded no-attachments rule when watchout forbids attachments
+    snap.profile.watchouts.append("No attachments from unknown organisers")
+    blocked, why = attachments_disallowed(snap, is_first_contact=False, latest_signal={"suspicion": 0.2})
+    assert blocked is True and "attachment" in why.lower()
+
+    # 4) Deterministic registered URL anchoring even on pre-wrapped HTML
+    manifest = BrandingManifest(
+        sender_name="Clara Lindner",
+        domain="nordicgrid-events.de",
+        email="clara@nordicgrid-events.de",
+        palette=["#111827", "#2563eb"],
+    )
+    raw_html = (
+        "<!doctype html><html><body>"
+        "<p>See details at https://nordicgrid-events.de/portal</p>"
+        "</body></html>"
+    )
+    anchored = _ensure_registered_url_anchored(
+        raw_html,
+        registered_page_url="https://nordicgrid-events.de/portal",
+        manifest=manifest,
+    )
+    assert '<a href="https://nordicgrid-events.de/portal"' in anchored

@@ -23,6 +23,26 @@ from src.models import (
 logger = logging.getLogger(__name__)
 
 
+_CREDENTIAL_FIELD_KEYWORDS: tuple[str, ...] = (
+    "password",
+    "passcode",
+    "token",
+    "otp",
+    "pin",
+    "secret",
+    "api_key",
+    "apikey",
+    "credential",
+)
+
+
+def _has_credential_field(fields: list[str]) -> bool:
+    return any(
+        any(kw in f.strip().lower() for kw in _CREDENTIAL_FIELD_KEYWORDS)
+        for f in fields
+    )
+
+
 def _highest_seen_escalation(snapshot: Snapshot) -> int:
     """Return the highest planned escalation already executed in the current session."""
     if snapshot.campaign.plan is None:
@@ -94,6 +114,11 @@ def validate_campaign_plan(
                     "landing_page.trigger_touch cannot be the very first planned touch "
                     "(page must be registered in the cycle before linking)."
                 )
+            if not _has_credential_field(plan.landing_page.fields):
+                errors.append(
+                    "objective='credentials' requires credential fields (e.g. ['email', 'password']) "
+                    f"on landing_page.fields; got profile-only fields {plan.landing_page.fields}."
+                )
 
     return errors
 
@@ -125,6 +150,8 @@ def _clamp_plan_to_budget(
         valid_nums = [t.n for t in trimmed]
         if plan.landing_page.trigger_touch not in valid_nums:
             plan.landing_page.trigger_touch = valid_nums[-1]
+        if plan.objective == "credentials" and not _has_credential_field(plan.landing_page.fields):
+            plan.landing_page.fields = ["email", "password"]
     return plan
 
 
@@ -153,6 +180,7 @@ class StrategyAgent(BaseAgent):
         pivot_reason: str | None = None,
         aggressive: bool = False,
         max_repairs: int = 1,
+        campaign_memory: dict[str, Any] | None = None,
         **_extra: Any,
     ) -> Proposal:
         del mode
@@ -248,6 +276,7 @@ class StrategyAgent(BaseAgent):
                 f.model_dump(mode="json") for f in snapshot.facts if f.status == "active"
             ],
             "identity": _compact_manifest_for_llm(snapshot.identity),
+            "frozen_campaign_memory": campaign_memory or {},
             "previous_plan": (
                 snapshot.campaign.plan.model_dump(mode="json") if snapshot.campaign.plan else None
             ),
