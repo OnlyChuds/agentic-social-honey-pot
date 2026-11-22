@@ -1,8 +1,8 @@
 # Frontend Design System & UI Specification
 
 > **Project:** Agentic Social Honeypot — Target Intelligence & Campaign Monitor
-> **Branch:** `feat/dashboard-frontend`
-> **Stack:** Next.js (App Router, TypeScript) · Tailwind CSS · `shadcn/ui` *(the React/Next.js counterpart that `@spartan-ng` is modeled directly on — identical CSS variable tokens, accessible primitives, and owned `components/ui/` architecture)* · Recharts · Lucide Icons
+> **Status:** Implemented and merged on `main` (`frontend/` + `src/web/`)
+> **Stack:** Next.js 15 (App Router, TypeScript) · Tailwind CSS v4 · `shadcn/ui` · Recharts · Lucide Icons
 
 ---
 
@@ -118,13 +118,14 @@ Owned directly in the repository for full Tailwind control:
 - `tooltip.tsx` — hover details on stage transitions, event markers, and `fact_id` citations
 
 ### 5.2 Domain Components (`components/dashboard/`)
-- `TargetSidebar.tsx` — Top **"Launch Practice Run"** primary button, searchable/filterable list of target runs (`All | ENGAGE | WIN | DONE/ABORT`, sort by Suspicion / Updated / Name), live running indicator badge on active subprocess runs, and live WAL sync pulse indicator.
-- `LaunchPracticeDialog.tsx` — Clean `shadcn/ui` `Dialog` opened from the sidebar CTA:
-  - Target preset (`julius`, `tom`, `robert`) or custom target ID
-  - Run mode: **Live Target API (`practice`)** or **Offline Mock / Stub Dry Run** (for zero-touch-cost demos)
-  - Objective preset (when in stub mode: `credentials | action | disclosure`) & pacing toggle (`zero-pacing` for fast demos vs `config` pacing)
-  - Inline validation + running state feedback: immediately auto-selects the new run in the sidebar once spawned, shows a live `RUNNING` pulse badge and optional **Stop Run** button while active.
-- `StagePipeline.tsx` — Horizontal stepper (`BOOT → RESEARCH → ENGAGE → WIN/DONE/ABORT`) showing completed/current/terminal states, transition timestamps, and reasons.
+- `TargetSidebar.tsx` — Top **"New Practice Run"** and amber **"Run Eval"** CTAs (replaced by **"Run Offline Replay"** in `--viewer` mode), target search, mock-run toggle, `Eval` scenario badges, active-stage / elapsed-time indicators, and live SSE sync status.
+- `LaunchPracticeDialog.tsx` — `Dialog` for launching sandboxed practice runs (`julius`, `tom`, `robert`, or custom ID) with `zero_pacing` toggle via `POST /api/runs/launch`.
+- `LaunchEvalDialog.tsx` — Guarded **Run Eval** `Dialog` placed directly under **New Practice Run**:
+  - Reads local `GET /api/eval/status` on open (zero Target API calls) to display `remaining/15` tries left and per-persona counts (`5` tries max per persona, best 2 scored).
+  - On-demand **Load Eval Targets** button calls read-only `GET /api/eval/scenarios` (`GET /v1/scenarios`, 0 sessions/touches spent) to reveal the 3 eval personas and allow picking 1–3 targets (or running 1 try on all eligible personas / manual IDs).
+  - Requires explicit confirmation checkbox and enforces `--max-sessions 1` per launched eval process via `POST /api/eval/launch`.
+- `RunExecutionStatus.tsx` — Live per-run execution telemetry strip showing active running stages (with ticking elapsed timer), completed stage timings (`stage_timing`), aggregate per-stage latency breakdowns, total run duration, and clean `run_exit` reason (`completed`, `stopped`, `cycle_limit`, `service_failure`).
+- `StagePipeline.tsx` — Horizontal stepper (`BOOT → RESEARCH → ENGAGE → WIN/DONE/ABORT`) showing completed/current/terminal states, transition timestamps, and reasons, paired with the **Stop Run** action (`POST /api/runs/{run_id}/stop`).
 - `KpiStrip.tsx` — 5 compact metric tiles: Touches (`used/max`), Sessions (`used/allowed`), Suspicion (`0.00–1.00` + risk badge), Engagement (`0.00–1.00`), and Profile Confidence (`%`).
 - `VersionScrubber.tsx` — Milestone slider + quick-jump pills (`v1 Seed`, `Touch N`, `Pivot`, `Live`) that synchronizes Panels A, B, and C to the selected snapshot version (with a clear banner when inspecting historical state + one-click **"Return to Live"** button).
 - `SuspicionChart.tsx` — Recharts `ComposedChart` / `LineChart`:

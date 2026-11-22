@@ -130,11 +130,12 @@ Pinning these signatures ensures Wave 1 workers build cleanly in parallel withou
   - `src/agents/visual_artifacts.py`: Playwright `render_visual_artifact_png()` one-pager/agenda renderer.
   - `src/agents/qa.py`: speaker/panelist/org placeholder detection + deterministic `check_past_dates(..., reference_date=...)` wired into `run_deterministic_checks`, `QAAgent.evaluate`, `QAAgent.run`, and `run_qa_loop`.
   - `tests/unit/test_craft_pages_qa.py` & `tests/unit/test_landing_pages_qa.py`: unit + Playwright coverage verified.
-- **Workstream D (`agents-prompts`) — Code & Tests Complete**
+- **Workstream D (`agents-prompts`) — Complete**
   - `src/models.py`: added `EmailStyle`, `SystemSenderAlias`, `BrandingManifest.system_senders`, `CampaignPlan.pages`, `TouchSpec.email_style` / `sender_alias` / `story_delay_minutes`.
   - `src/agents/messaging.py`: upgraded 22-channel `resolve_sender_for_channel(..., sender_alias=...)`, `ConversationTurnDraft.hang_up`, `compose()` wiring (`current_story_time`, `channel_info`, `email_style`, `objective`, `action_artifact`, `sender_alias`, adaptive `personal_html` vs `branded_card`), and `compose_live_turn()` (`persona_says`, `turn_index`, `current_story_time`, `registered_page_url`, `hang_up`).
   - `src/agents/strategy.py`: forwards `current_story_time`, `available_channels`, and `target_memory`; validates and clamps multi-page `plan.pages` alongside `plan.landing_page`.
   - `src/agents/profile.py`: accepts `page_submissions`, `call_transcript`, and `recent_events` anchors for disclosure extraction.
+  - `prompts/strategy.md`, `prompts/messaging.md`, `prompts/profile.md`, `prompts/qa.md`: updated with live-call, date-grounding, `email_style`, win-funnel, and disclosure-form rules.
   - `tests/unit/test_agents_api_leverage.py`: unit coverage verified.
 - **Workstream E (`orchestrator-wire`) — Complete**
   - `src/orchestrator/loop.py`, `src/orchestrator/state.py`, `src/main.py`:
@@ -143,13 +144,10 @@ Pinning these signatures ensures Wave 1 workers build cleanly in parallel withou
     - Wired multi-page registration / URL replacement (`plan.pages`, `force=True`) and on-demand Playwright PNG briefing sheet upload (`render_visual_artifact_png`).
     - Wired `classify_page_submission()` & `extract_page_submission_summary()` (`disclosure_candidate` → `ProfileAgent`, `step_up` → trust boost without premature termination).
     - Wired `TargetMemoryStore` (`seed_from_memory` on bootstrap, `update_from_snapshot()` on exit).
-    - Session hygiene: cached `GET /v1/channels`, remote session reconciliation on `--resume`, and clean `end_session()` on `WIN`/`DONE`.
+    - Session hygiene: cached `GET /v1/channels`, remote session reconciliation on `--resume`, `--max-sessions` cap for single-try eval runs, and clean `end_session()` on `WIN`/`DONE`.
   - `tests/unit/test_live_conv_and_story_clock.py`: end-to-end integration tests verified.
-- **Wave 3 Offline Verification — Complete**
-  - `uv run pytest`: **126 passed** (0 failures).
-  - `uv run ruff check src/ tests/`: **All checks passed**.
-
-### Remaining (Optional)
-
-- **Prompt wording refinements**: `prompts/strategy.md` and `prompts/messaging.md` can optionally be expanded with explicit natural-language guidance for the newly wired fields (`available_channels`, `target_memory`, `current_story_time`, `pages`, `email_style`, and multi-turn live calls).
-- **Live practice smoke test**: optional live check against `target-api` (`julius` / `tom`, 0 `eval` touches) to confirm non-null `story_time`, live multi-turn call recording, and `status: "ended"` on exit.
+- **Dashboard Eval Launcher & Guardrails — Complete**
+  - `frontend/src/components/dashboard/LaunchEvalDialog.tsx`, `TargetSidebar.tsx`, `src/web/server.py`, `src/web/runner.py`: added **Run Eval** button under **New Practice Run** with `GET /api/eval/status` (local-only), on-demand read-only `GET /api/eval/scenarios`, and confirmed `POST /api/eval/launch` enforcing the updated **5 tries per persona / 15 total** limits (best 2 per persona scored) with `--max-sessions 1` per launch.
+- **Wave 3 Verification — Complete**
+  - Offline suite: **131 tests collected/verified** (`pytest`, `ruff`, frontend `tsc --noEmit`).
+  - Live `practice` validation completed on `main` (`v2` / `f815acb`).

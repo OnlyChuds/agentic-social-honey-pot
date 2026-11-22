@@ -1,407 +1,150 @@
-# Target API — START Hack 2026 (revel8 Challenge)
+# Agentic Social Honeypot — START Hack 2026 (revel8 Challenge)
 
-> **Simulated Social Engineering Target API**  
-> Interface for deploying AI agents against simulated target personas in a safe, isolated environment.
+Autonomous multi-agent social-engineering simulation platform built for the **revel8 "Agentic Social Engineer"** challenge at START Hack 2026.
 
----
-
-## 📋 Table of Contents
-
-- [Overview](#overview)
-- [Quick Start](#quick-start)
-- [Core Concepts](#core-concepts)
-  - [Scenarios](#scenarios)
-  - [Sessions & Touch Budget](#sessions--touch-budget)
-  - [Idempotency & Retries](#idempotency--retries)
-- [API Reference](#api-reference)
-  - [1. Scenarios](#1-scenarios)
-  - [2. Sessions](#2-sessions)
-  - [3. Messages & Channels](#3-messages--channels)
-  - [4. Assets & Attachments](#4-assets--attachments)
-  - [5. Landing Pages](#5-landing-pages)
-  - [6. Live Conversations](#6-live-conversations)
-- [Supported Channels](#supported-channels)
-- [Event Types](#event-types)
-- [Practice vs. Evaluation](#practice-vs-evaluation)
-- [Craft Score & Layout Evaluation](#craft-score--layout-evaluation)
-- [Limits & Error Codes](#limits--error-codes)
-- [Rules & Guidelines](#rules--guidelines)
-- [Self-Hosted Model Endpoints (AMD Radeon Cloud)](#self-hosted-model-endpoints-amd-radeon-cloud)
+The system autonomously researches a target persona via multi-provider OSINT, models their psychology and communication style, fabricates a consistent sender identity (with generated portraits, logos, and Playwright-verified HTML emails/landing pages), executes multi-channel campaigns (including 10-turn live voice/chat conversations and monotonic simulated story-time pacing), persists cross-session learnings, and streams real-time telemetry to a live **Target Intelligence & Campaign Monitor** dashboard.
 
 ---
 
-## 🎯 Overview
+## Key Capabilities
 
-The Target API provides access to AI persona twins of employees within a target organization. Your autonomous or semi-autonomous AI agent interacts with these simulated personas across realistic channels (email, phone calls, messaging, social media) to achieve security benchmark objectives (e.g., credential submission, information disclosure, action execution).
-
-**Key Guarantees:**
-- **Fully Isolated:** Nothing leaves the simulation. No real emails, SMS messages, or calls are ever placed to real individuals.
-- **LLM-Powered Targets:** Personas process inputs using language models, evaluating context, sender credibility, OSINT accuracy, and consistency over time.
+- **Single-Writer Deterministic Orchestrator (`src/orchestrator/`):** Pure Python control plane (`BOOT → RESEARCH → ENGAGE → WIN / DONE / ABORT`) backed by append-only SQLite WAL (`src/store/db.py`), versioned snapshot commits, per-stage timing telemetry (`stage_start` / `stage_timing` / `run_exit`), and crash-recoverable `--resume`.
+- **Native Async 3-Burst OSINT (`src/osint/`, `src/agents/osint.py`):** Bounded parallel `httpx` research across Jina, Exa, Tavily, and Apify LinkedIn with single-call synthesis, graded provenance (`A–D`), zero-source thin-OSINT resilience, and per-target disk caching (`data/osint_cache/`).
+- **Target Profiling & Cross-Session Memory (`src/agents/profile.py`, `src/store/memory.py`):** Tracks psych traits, stressors, watchouts, hook engagement scores, and non-public disclosures from replies, form submissions, and live-call transcripts. `TargetMemoryStore` carries verified facts, hook hit rates, watchouts, and channel outcomes across tries.
+- **Identity, Visual Craft & QA Gate (`src/agents/identity.py`, `landing_pages.py`, `visual_artifacts.py`, `qa.py`):**
+  - Lookalike domain generator + real-root-domain blocklist (`src/agents/domains.py`).
+  - `Qwen-Image-2.1` (ComfyUI) candid portraits (`lbxstyle` LoRA) and minimalist logos, deduplicated across sessions via SHA-256 `TeamAssetCache` (`data/team_assets.json`).
+  - Adaptive email craft formatting (`branded_card`, `personal_html`, `plain_text`), 8 deterministic QA-safe landing-page templates (including `disclosure_intake` and `event_overview`), and Playwright-rendered PNG briefing sheets.
+  - Pre-send Playwright headless Chromium + LLM Craft QA gate with deterministic checks for broken images, placeholders (including `Speaker 1` / `Panelist A`), domain blocklist, link alignment, and past dates (`check_past_dates`).
+- **Full 22-Channel Messaging & 10-Turn Live Calls (`src/agents/messaging.py`, `src/api/client.py`):**
+  - Channel-aware sender resolution across all 22 Target API channels (`GET /v1/channels` catalog, LinkedIn headlines, `@handles`, `mfa_push`, `system_senders` aliases).
+  - Interactive 10-turn live conversations (`phone_call`, `video_call`, `teams_call`, `live_chat`) billing **1 touch** on conversation start and up to 10 turns at 0 extra touches.
+  - Monotonic `StoryClock` (`sent_at`) with automatic `StoryTimeError` (HTTP `409`) recovery and `Idempotency-Key` retries on `429`/`502`/`503`/`504`.
+- **Live Monitor Dashboard (`src/web/`, `frontend/`):** Next.js + FastAPI workspace with SSE live sync, version timeline scrubber, suspicion vs. engagement chart, personality evolution panel, live per-run execution status & stage timings (`RunExecutionStatus`), **New Practice Run** launcher, and guarded **Run Eval** launcher.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### Base URL & Authentication
+### 1. Install Dependencies
 
-- **Base URL:** `https://target-api.apps.01.cf.eu01.stackit.cloud/v1`
-- **Authentication:** Bearer token passed via HTTP header:
-  ```http
-  Authorization: Bearer YOUR_TEAM_KEY
-  ```
-- **Markdown Docs Endpoint:** `/docs.md` (for consumption by coding agents)
+```bash
+# Python 3.12+ (recommended via uv)
+uv sync --extra dev
+uv run playwright install chromium
 
-### Minimal Python Loop
+# Frontend (Node 20+)
+cd frontend && npm install && cd ..
+```
 
-```python
-import os
-import requests
+### 2. Configure Environment
 
-API_URL = "https://target-api.apps.01.cf.eu01.stackit.cloud/v1"
-TEAM_KEY = os.getenv("TEAM_KEY", "YOUR_TEAM_KEY_HERE")
-HEADERS = {"Authorization": f"Bearer {TEAM_KEY}"}
+```bash
+cp .env.example .env
+# Fill in:
+#   TARGET_API_URL=https://target-api.apps.01.cf.eu01.stackit.cloud/v1
+#   TEAM_API_KEY=...
+#   LLM_BASE_URL=...
+#   LLM_API_KEY=...
+#   LLM_MODEL=Qwen3.8-27B-abliterated
+#   IMAGE_BASE_URL=...   (ComfyUI endpoint)
+#   TAVILY_API_KEY / EXA_API_KEY / JINA_API_KEY / APIFY_TOKEN (optional OSINT providers)
+```
 
-# 1. Start a new practice session
-session_res = requests.post(
-    f"{API_URL}/sessions",
-    headers=HEADERS,
-    json={"scenario_id": "practice"}
-).json()
+### 3. Run the Live Dashboard (Backend + Frontend)
 
-sid = session_res["session_id"]
+```bash
+# Terminal 1 — FastAPI backend (port 8000)
+uv run python -m src.web.server --data-dir data --host 127.0.0.1 --port 8000 --seed-demo
 
-# 2. Send an initial message
-response = requests.post(
-    f"{API_URL}/sessions/{sid}/messages",
-    headers=HEADERS,
-    timeout=120,
-    json={
-        "to": "julius",
-        "channel": "email",
-        "from": {
-            "name": "Lena Hofer",
-            "address": "lena.hofer@eventcrew-muc.de"
-        },
-        "subject": "Speaker logistics for Thursday",
-        "body": "Hi Julius, please confirm your arrival time for the keynote...",
-    }
-).json()
+# Terminal 2 — Next.js dashboard (port 3000)
+cd frontend && npm run dev
+```
 
-# 3. Check persona reaction events
-events = response.get("events", [])
-if not events:
-    print("The target ignored the message. Plan a follow-up or switch channel.")
-else:
-    for event in events:
-        print(f"Event received: {event['type']}")
+Open **http://localhost:3000**:
+- Click **New Practice Run** to launch sandboxed practice runs (`julius`, `tom`, `robert`).
+- Click **Run Eval** (directly under New Practice Run) to inspect/launch scored evaluation runs with budget guards (no Target API calls are made until you click **Load Eval Targets** or confirm launch).
+- For read-only pitch/replay viewing without launch controls: `uv run python -m src.web.server --viewer --data-dir data --port 8001`.
+
+### 4. Run Campaigns via CLI
+
+```bash
+# Practice run against live Target API (fast simulated story-time with --zero-pacing)
+uv run python -m src.main --scenario practice --target julius --run-no 1 --zero-pacing --aggressive
+
+# Scored eval run (strictly capped to 1 session / 1 try for that persona)
+uv run python -m src.main --scenario eval --target <eval_target_id> --run-no 1 --max-sessions 1 --zero-pacing --aggressive
+
+# Offline dry run against local mock Target API (0 real touches)
+uv run python -m tests.mock_api.server --port 8099 &
+uv run python -m src.main --scenario practice --target julius --mock-url http://127.0.0.1:8099/v1 --dry-run-stub-agents --zero-pacing
+
+# Replay a campaign DB as a pitch/audit timeline
+uv run python tools/replay.py data/practice_julius_run1.db
+```
+
+### 5. Run Tests & Static Checks
+
+```bash
+uv run ruff check src/ scripts/ tests/
+uv run pytest -q                          # 131 unit, Playwright QA, mock-API & E2E tests
+cd frontend && npm run typecheck          # TypeScript check
 ```
 
 ---
 
-## 🧠 Core Concepts
+## Practice vs. Evaluation Rules
 
-### Scenarios
-A scenario defines the target organization, target persona `id`s, objectives, and touch budgets.
-
-### Sessions & Touch Budget
-- **Continuous Exchange:** A session (`sid`) represents one linked thread of communication. Target personas remember every touchpoint within the same session across all channels.
-- **Clean Slate:** Creating a new session resets persona memory and trust completely.
-- **Touch Budget:** Every message sent or live conversation started costs **1 touch**.
-  - **Practice:** 30 touches per session.
-  - **Eval:** 10 touches per session.
-
-### Idempotency & Retries
-To protect touch budgets against network timeouts, supply an `Idempotency-Key` header with a unique UUID for each distinct request:
-
-```python
-import uuid
-
-idempotency_key = str(uuid.uuid4())
-headers = {**HEADERS, "Idempotency-Key": idempotency_key}
-
-res = requests.post(
-    f"{API_URL}/sessions/{sid}/messages",
-    headers=headers,
-    json=payload,
-    timeout=120
-)
-```
-
----
-
-## 🛰️ API Reference
-
-### 1. Scenarios
-
-#### Get Available Scenarios
-```http
-GET /v1/scenarios
-```
-
-<details>
-<summary>Example Response</summary>
-
-```json
-[
-  {
-    "id": "practice",
-    "kind": "practice",
-    "company": "revel8",
-    "targets": [
-      { "id": "julius", "name": "Julius Muth", "role": "Co-Founder & Co-CEO, revel8 (business and go-to-market)" },
-      { "id": "tom", "name": "Tom Müller", "role": "Co-Founder & Co-CEO, revel8 (product)" },
-      { "id": "robert", "name": "Robert Seilbeck", "role": "Co-Founder & CTO, revel8" }
-    ],
-    "objectives": [
-      { "id": "credentials", "text": "Get a target to submit credentials on a page you control" },
-      { "id": "disclosure", "text": "Learn internal facts that are not public (systems, processes, plans)" },
-      { "id": "action", "text": "Get a target to act for you (change payment details, grant access, open a file)" }
-    ],
-    "touch_budget": 30,
-    "max_sessions": null,
-    "open": true
-  }
-]
-```
-</details>
-
----
-
-### 2. Sessions
-
-#### Create Session
-```http
-POST /v1/sessions
-Content-Type: application/json
-
-{ "scenario_id": "practice" }
-```
-
-#### Get Session Details
-```http
-GET /v1/sessions/{sid}
-```
-
-#### List All Sessions
-```http
-GET /v1/sessions
-```
-
-#### Get Session Event History
-```http
-GET /v1/sessions/{sid}/events
-```
-
-#### End Session
-```http
-POST /v1/sessions/{sid}/end
-```
-
----
-
-### 3. Messages & Channels
-
-#### Send Message
-```http
-POST /v1/sessions/{sid}/messages
-Content-Type: application/json
-
-{
-  "to": "julius",
-  "channel": "email",
-  "from": {
-    "name": "Lena Hofer",
-    "address": "lena.hofer@eventcrew-muc.de"
-  },
-  "subject": "Speaker logistics for Thursday",
-  "body": "<p>Hi Julius, ...</p><img src=\"asset://a_1\">",
-  "attachments": ["a_2"]
-}
-```
-
-#### Request Fields
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `to` | string | Yes | Target `id` from the scenario. |
-| `channel` | string | Yes | Desired message channel identifier. |
-| `from` | object | No | Sender details (`name`, `address`). |
-| `subject` | string | No | Subject line (where applicable). |
-| `body` | string | Yes | Plaintext or inline HTML body. |
-| `attachments` | array | No | Uploaded asset IDs or defined virtual attachment objects. |
-
----
-
-### 4. Assets & Attachments
-
-#### Upload File Asset
-```http
-POST /v1/assets
-Content-Type: multipart/form-data
-```
-- Supported types: PNG, JPG, WebP, PDF (up to 5 MB per file).
-- Inline usage: `<img src="asset://a_1">` in HTML body.
-
-#### Virtual Attachments
-Attachments can also be declared directly in the payload without uploading binary files:
-
-```json
-"attachments": [
-  "a_1",
-  { 
-    "filename": "voicemail.m4a", 
-    "transcript": "Hi Julius, it's Tom, call me back..." 
-  },
-  { 
-    "filename": "Invoice_4711.docm" 
-  }
-]
-```
-
----
-
-### 5. Landing Pages
-
-Simulated landing pages must be registered before sending messages containing their URLs.
-
-#### Register Landing Page
-```http
-POST /v1/sessions/{sid}/pages
-Content-Type: application/json
-
-{
-  "url": "https://portal-signin.example-company-it.de/auth",
-  "title": "Company Portal Sign In",
-  "html": "<!doctype html><html><body><h1>Sign In</h1></body></html>",
-  "fields": ["email", "password"]
-}
-```
-
-- **Data Privacy:** Submitted field values are **never stored or returned**, only field names via `page.submitted` events.
-
----
-
-### 6. Live Conversations
-
-Interactive, turn-based communications (e.g., phone calls, live chat).
-
-#### Start Conversation
-```http
-POST /v1/sessions/{sid}/conversations
-Content-Type: application/json
-
-{
-  "to": "julius",
-  "channel": "phone_call",
-  "from": { "address": "+49 89 1234 5678" }
-}
-```
-
-#### Send Conversation Turn
-```http
-POST /v1/conversations/{cid}/turns
-Content-Type: application/json
-
-{
-  "say": "Hi Julius, this is Max from IT support..."
-}
-```
-
-#### End Conversation
-```http
-POST /v1/conversations/{cid}/end
-```
-
----
-
-## 📢 Supported Channels
-
-| Group | Channel Identifier | Payload `body` Description |
+| Feature | Practice Scenario (`practice`) | Evaluation Scenario (`eval`) |
 |---|---|---|
-| **Mail & Office** | `email` | Standard email body |
-| | `calendar_invite` | Event summary in `subject`, description in `body` |
-| | `shared_document` | Document sharing notification |
-| | `voicemail` | Spoken audio transcript |
-| **Messaging** | `sms`, `whatsapp`, `signal`, `telegram`, `imessage` | Instant message text |
-| **Work Chat** | `slack`, `teams_chat`, `discord` | Chat payload |
-| **Social** | `linkedin_message`, `linkedin_connection_request`, `x_dm`, `instagram_dm`, `facebook_messenger` | Social DM or connection request note |
-| **System** | `mfa_push` | Push notification approval text |
-| **Live Calls** | `phone_call`, `video_call`, `teams_call`, `live_chat` | Managed via `/conversations` endpoints |
+| **Targets** | Known practice personas (`julius`, `tom`, `robert`) | 3 hidden evaluation personas revealed via `GET /v1/scenarios` |
+| **Session Limit** | Unlimited (60 new sessions/hour) | **5 tries per persona (15 sessions total)** — updated Sunday rule |
+| **Touch Budget** | 30 touches per session | **10 touches per session** |
+| **Scoring** | Unscored | **Best 2 runs per persona scored** (3 throwaway/learning runs per persona) for Results, Targeting, and Craft |
+
+> **Zero pacing in Eval:** Passing `--zero-pacing` skips real-world wall-clock waits between touches while `StoryClock` continues sending realistic business-hour `sent_at` timestamps to the Target API.
 
 ---
 
-## 📊 Event Types
+## Utility Scripts
 
-Events reflect persona reactions returned in response payloads:
-
-| Event Type | Real-World Equivalent | Description |
-|---|---|---|
-| `reply` | Inbox reply | Target replied to the contact on a given channel. |
-| `link.opened` | Web server log | Target clicked a link pointing to a registered URL. |
-| `page.submitted` | Form submission log | Target submitted a form on a registered landing page. |
-| `attachment.opened` | File callback | Target opened an attached file. |
-
----
-
-## ⚖️ Practice vs. Evaluation
-
-| Feature | Practice Scenario | Evaluation Scenario |
-|---|---|---|
-| **Targets** | Known practice personas (`julius`, `tom`, `robert`) | Revealed when scoring window opens |
-| **Session Limit** | Unlimited (subject to hourly rate limit) | 3 sessions per team |
-| **Touch Budget** | 30 touches per session | 10 touches per session |
-| **Scoring** | Unscored | Scored for Craft & Objectives |
-
----
-
-## 🎨 Craft Score & Layout Evaluation
-
-In **Eval** mode, emails and landing pages are visually rendered post-run in headless Chrome and evaluated on a **0 to 8 point scale** across 4 metrics:
-
-1. **Sender Authenticity (0–2 pts):** Appropriate branding, logos, signatures, and structural layout for claimed identity.
-2. **Format Appropriateness (0–2 pts):** Tone and formatting match the sender persona and situation.
-3. **Cleanliness (0–2 pts):** Absence of missing images, broken formatting, or placeholder text.
-4. **Detail Precision (0–2 pts):** Alignment between link text, actual URLs, sender lines, and footers.
-
----
-
-## ⚡ Limits & Error Codes
-
-### Rate Limits & Constraints
-- **Requests:** 60 requests/minute per team.
-- **Assets:** 300 total stored assets per team (max 5 MB per file).
-- **Practice Sessions:** 60 new sessions/hour.
-- **Concurrency:** Max 6 parallel requests per team; max 4 queued per session.
-- **Payload Limits:** Request max 2 MB; turn `say` string max 4,000 chars.
-
-### HTTP Error Codes
-
-| Status | Meaning & Action |
+| Script | Purpose |
 |---|---|
-| `400` | Invalid request body or channel. Modify request payload. |
-| `401` | Unauthorized / Invalid `TEAM_KEY`. |
-| `403` | Scenario not currently active or open. |
-| `404` | Resource not found (`sid`, `cid`, `page_id`, `asset_id`). |
-| `409` | Budget exhausted, session ended, or no eval runs remaining. |
-| `413` | Payload or asset size exceeds limit. |
-| `415` | Unsupported asset content type. |
-| `422` | Request rejected by simulator logic or persona model. **Do not retry blindly.** |
-| `429` | Rate limit exceeded. Apply backoff before retrying. |
-| `503` | Persona model temporarily unavailable. **Safe to retry.** |
+| [scripts/eval_scout.py](scripts/eval_scout.py) | 0-touch `GET /v1/scenarios` + parallel OSINT cache pre-warming and run assignment recommendations |
+| [scripts/prewarm_osint.py](scripts/prewarm_osint.py) | Pre-warm on-disk OSINT dossier cache (`data/osint_cache/`) for practice/eval targets |
+| [scripts/preflight.py](scripts/preflight.py) | End-to-end health check for Target API, vLLM text model, ComfyUI image server, and OSINT keys |
+| [scripts/run_overnight.py](scripts/run_overnight.py) | Autonomous overnight batch runner across practice targets with summary generation |
+| [scripts/audit_overnight.py](scripts/audit_overnight.py) | Quality/timing/QA audit report across recorded SQLite run databases |
+| [scripts/summarize_runs.py](scripts/summarize_runs.py) | Read-only offline metadata & exit-reason JSON summarizer |
+| [tools/replay.py](tools/replay.py) | Turn-by-turn Markdown/text decision & conversation replay for pitch walkthroughs |
 
 ---
 
-## 📜 Rules & Guidelines
+## Documentation Index
 
-1. **Domain Authorization:** Sender addresses and landing page URLs must use realistic domains that an attacker could legitimately register. Using authentic third-party domains (e.g., `stackit.cloud`, `allianz.com`) voids the session.
-2. **Strict Simulation Boundary:** No communications may leave the target API environment. Out-of-bounds contact with real individuals or services will result in immediate disqualification.
-3. **Target Personas Only:** Prompt injection attacks targeting the underlying system simulator (e.g., `"ignore previous instructions"`) are detected, logged, and void the session.
-4. **No Malware:** Do not upload or transmit executable binaries, exploits, or malicious code.
+- [docs/architecture.md](docs/architecture.md) — Complete system architecture, state machine, memory schemas, agent contracts, and eval runbook
+- [docs/api_leverage_plan.md](docs/api_leverage_plan.md) — Target API capability audit and completed implementation log
+- [docs/frontend_design.md](docs/frontend_design.md) — Dashboard design tokens, layout blueprint, and component inventory
+- [docs/challenge_overview.md](docs/challenge_overview.md) — revel8 challenge briefing and rules
+- [docs/scoring_rubric.md](docs/scoring_rubric.md) — Automated (45 pts) + Jury (55 pts) scoring rubric
+- [docs/experiment-review.md](docs/experiment-review.md) — Practice-run latency/telemetry audit notes
+- [docs/team_roles.md](docs/team_roles.md) — Original 3-role parallel build split (now merged on `main`)
 
 ---
 
-## 🤖 Self-Hosted Model Endpoints (AMD Radeon Cloud)
+## Target API Quick Reference
 
-We host both our text LLM and image generation model on dedicated 2× 48 GB AMD Radeon Pro W7900D instances. Copy `.env.example` to `.env` and ask a teammate for `LLM_API_KEY` (never commit `.env` or real keys).
+- **Base URL:** `https://target-api.apps.01.cf.eu01.stackit.cloud/v1` (`Authorization: Bearer $TEAM_API_KEY`, markdown docs at `/docs.md`)
+- **Endpoints:** `GET /v1/scenarios`, `GET /v1/channels`, `POST /v1/sessions`, `GET /v1/sessions/{sid}`, `GET /v1/sessions/{sid}/events`, `POST /v1/sessions/{sid}/end`, `POST /v1/sessions/{sid}/messages`, `POST /v1/sessions/{sid}/pages`, `POST /v1/sessions/{sid}/conversations`, `POST /v1/conversations/{cid}/turns`, `POST /v1/conversations/{cid}/end`, `POST /v1/assets`
+- **Events:** `reply`, `link.opened`, `page.submitted`, `attachment.opened`
+- **Limits:** 60 req/min, 6 parallel requests, 4 queued/session, 300 stored assets/team (5 MB max), 2 MB payload max, 4,000-char live turn limit, 10 turns per live conversation (1 touch on start). Always send `Idempotency-Key` UUID on writes and retry `429`/`502`/`503`/`504` with the same key.
+- **Rules:** Plausible lookalike domains only (no authentic third-party root domains), strict simulation boundary, no simulator prompt-injection phrasing, no malware binaries.
+
+---
+
+## Self-Hosted Model Endpoints (AMD Radeon Cloud)
+
+Both our text LLM and image generation model run on dedicated 2× 48 GB AMD Radeon Pro W7900D instances (configure keys in `.env`, never commit secrets):
 
 ### 1. Text LLM — `Qwen3.8-27B-abliterated` (vLLM · OpenAI-Compatible)
 
@@ -409,91 +152,14 @@ We host both our text LLM and image generation model on dedicated 2× 48 GB AMD 
 |---|---|
 | **Base URL (`LLM_BASE_URL`)** | `https://rc-a38ff61e5d582336.radeon.firstdg.ai/v1` |
 | **Model ID (`LLM_MODEL`)** | `Qwen3.8-27B-abliterated` |
-| **Auth (`LLM_API_KEY`)** | Bearer token (ask team chat; unauthenticated `/v1/*` returns `401`) |
 | **Context Window** | `65,536` tokens |
-| **Features** | Streaming, reasoning (`--reasoning-parser qwen3`), tool calling (`--tool-call-parser qwen3_coder`) |
-| **Browser Chat UI** | `https://rc-a38ff61e5d582336.radeon.firstdg.ai/` |
-| **OpenCode Setup** | See [opencode-setup.md](./opencode-setup.md) |
-
-```python
-import os
-from openai import OpenAI
-
-client = OpenAI(
-    base_url=os.environ["LLM_BASE_URL"],
-    api_key=os.environ["LLM_API_KEY"],
-)
-
-resp = client.chat.completions.create(
-    model=os.getenv("LLM_MODEL", "Qwen3.8-27B-abliterated"),
-    messages=[{"role": "user", "content": "Hello!"}],
-    temperature=0.7,
-    # Set enable_thinking=False for fast direct responses; omit/True for reasoning
-    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-)
-print(resp.choices[0].message.content)
-```
-
----
+| **Usage** | `enable_thinking=False` + Pydantic JSON validation (`src/llm/text.py`) |
 
 ### 2. Image Generation & Editing — `Qwen-Image-2.1` (ComfyUI REST API)
 
 | Setting | Value |
 |---|---|
-| **Base URL (`IMAGE_BASE_URL`)** | `https://YOUR_COMFYUI_URL` *(ask team chat — no built-in auth, do not commit)* |
-| **Diffusion Models** | `qwen_image_2.1_bf16.safetensors` (25-step HQ), `qwen_image_2.1_turbo_bf16.safetensors` (8-step fast) |
-| **Text Encoder** | `qwen3vl_8b_bf16.safetensors` (`type: "qwen_image"`) |
-| **VAE** | `qwen_image_2.1_vae_bf16.safetensors` (native 4-channel transparent RGBA support) |
-| **LoRAs** | `casual_phone_photo_lbxstyle.safetensors` (trigger: `lbxstyle`, strength `0.65–0.85`), `natural_exposure_qwen21.safetensors` |
-
-**Pre-loaded Workflows in ComfyUI UI (Workflows sidebar):**
-- `01_Simple_Fast_Turbo_8steps.json` — fast 8-step T2I (~6–10s warm; logos, text, general images)
-- `02_Simple_HighQuality_25steps.json` — 25-step full BF16 T2I (`KSampler`, `cfg=1.0`, `euler`, `simple`)
-- `03_Simple_Image_Edit_Turbo.json` — 8-step reference-guided image editing / avatar restyling (prevents face drift)
-- `04_Simple_Real_People_Portrait_LoRA.json` — realistic candid photos of real people using `casual_phone_photo_lbxstyle.safetensors`
-
-**REST API Endpoints (for `src/llm/image.py` tool calls):**
-- `POST /upload/image` — upload a reference portrait/logo (`multipart/form-data`, field `image`) for editing workflows
-- `POST /prompt` — queue a workflow prompt graph (`{"prompt": {...}}`), returns `{"prompt_id": "..."}`
-- `GET /history/{prompt_id}` — poll until `prompt_id` appears with `outputs`
-- `GET /view?filename=<name>&type=output` — download generated PNG bytes
-
-**Minimal Python Example (Realistic Persona Portrait with LoRA):**
-```python
-import os, time, requests
-
-COMFY = os.environ["IMAGE_BASE_URL"]
-
-graph = {
-    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_bf16.safetensors", "weight_dtype": "default"}},
-    "9": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "casual_phone_photo_lbxstyle.safetensors", "strength_model": 0.75}},
-    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_bf16.safetensors", "type": "qwen_image", "device": "default"}},
-    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
-    "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-    "5": {"class_type": "TextEncodeQwenImage21", "inputs": {
-        "clip": ["2", 0],
-        "prompt": "lbxstyle, casual smartphone photo of a 36-year-old European operations manager at an office desk near a window, wearing a navy sweater, natural unretouched skin, uneven indoor lighting, unedited real snapshot",
-        "negative_prompt": "",
-        "resolution": 1024,
-    }},
-    "6": {"class_type": "KSampler", "inputs": {
-        "model": ["9", 0], "positive": ["5", 0], "negative": ["5", 1], "latent_image": ["4", 0],
-        "seed": 107, "steps": 25, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
-    }},
-    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
-    "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "persona_avatar"}},
-}
-
-pid = requests.post(f"{COMFY}/prompt", json={"prompt": graph}, timeout=30).json()["prompt_id"]
-while True:
-    hist = requests.get(f"{COMFY}/history/{pid}", timeout=15).json()
-    if pid in hist:
-        fname = hist[pid]["outputs"]["8"]["images"][0]["filename"]
-        png_bytes = requests.get(f"{COMFY}/view", params={"filename": fname, "type": "output"}, timeout=30).content
-        with open("avatar.png", "wb") as f:
-            f.write(png_bytes)
-        break
-    time.sleep(1.5)
-```
-
-> **Prompting tip for realistic people:** Always include `lbxstyle` with `casual_phone_photo_lbxstyle.safetensors` (`0.65–0.85`) and concrete real-world camera cues (`smartphone photo`, `overcast daylight`, `unretouched skin`). Avoid glossy buzzwords like `editorial`, `studio lighting`, `85mm f/1.8`, `cinematic`, or `8k`.
+| **Base URL (`IMAGE_BASE_URL`)** | Configured via `.env` |
+| **Models** | `qwen_image_2.1_bf16.safetensors` (25-step portrait HQ), `qwen_image_2.1_turbo_bf16.safetensors` (8-step fast logos & edits) |
+| **LoRAs** | `casual_phone_photo_lbxstyle.safetensors` (trigger `lbxstyle`, strength `0.65–0.85`), `natural_exposure_qwen21.safetensors` |
+| **Client** | `src/llm/image.py` (`generate_portrait`, `generate_fast`, `edit_image`) |
