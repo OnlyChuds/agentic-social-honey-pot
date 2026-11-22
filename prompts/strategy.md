@@ -33,10 +33,11 @@ whole game.
 4. **Escalation curve** — touch intent and escalation level must be explicit per
    touch (1–5, matching the messaging agent's ladder). Default eval curve:
    1, 2, 2, 3, 3, 3, 4 (page link), 4, 5, 5.
-5. **Landing page** (when the objective is credentials): declare pretext, fields,
-   `trigger_touch`, and `url_path` in the plan. The page is registered *before*
-   the touch that links it — the page-touch is where the link goes, and the
-   registration happens in the cycle before.
+5. **Landing page** (when the objective is credentials): declare a portal sign-in
+   pretext with credential fields (`["email", "password"]` — NOT profile-only
+   fields like `full_name`/`company`/`phone`), `trigger_touch`, and `url_path`.
+   Sequence the form ask AFTER commitment — never drop a registration/login ask
+   mid-verification. The page is registered *before* the touch that links it.
 6. **Pivot triggers** — list the exact conditions (e.g. "2 touches no reply",
    "suspicion >= 0.6", "hook h_X deflected twice") that send you back to
    re-planning within the same session.
@@ -54,6 +55,17 @@ whole game.
     fallback, not the point.
 11. **Practice vs eval**: in practice you may explore (wider net, slower curve);
     in eval every touch must be able to justify its existence against the median.
+12. **Front-load concrete specifics in touches 1–2**: lead with verifiable facts
+    (date, format, named organizers/topics, clear reason for outreach) early and
+    save heavier asks for later touches after rapport/commitment.
+13. **Customer-name facts**: treat named enterprise clients from OSINT as
+    own-public-usage context only; expect NDA/consent pushback if asking the
+    target to discuss specific customer deployments.
+14. **Cross-session consistency**: honor `frozen_campaign_memory` (dates, event
+    names, registered URLs) — never contradict previously stated years or URLs.
+15. **Verification pauses**: if the target says they will verify/check first,
+    supply requested verification details or switch channel (`sms`/`whatsapp`/
+    `linkedin_message`) rather than firing repeated silent emails.
 
 # Output (compact minified JSON only, conforms to `schemas/plan.json`; plan at most `budget.remaining_to_plan` touches with concise <=12-word `intent` strings)
 
