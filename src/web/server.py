@@ -32,7 +32,7 @@ class LaunchRunRequest(BaseModel):
     mode: Literal["mock_stub", "practice_live"] = "practice_live"
     stub_objective: Literal["credentials", "action", "disclosure"] = "credentials"
     zero_pacing: bool = True
-    aggressive: bool = False
+    aggressive: bool = True
     scenario: str = "practice"
 
 

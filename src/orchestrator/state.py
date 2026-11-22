@@ -649,6 +649,7 @@ class StateManager:
         facts_used: list[str] | None = None,
         attachments: list[str | dict[str, Any]] | None = None,
         cost_touch: bool = True,
+        story_time: str | None = None,
     ) -> Event:
         turn_no = len(self.snapshot.conversation.turns) + 1
         ev = Event(
@@ -663,6 +664,7 @@ class StateManager:
                 "idempotency_key": idempotency_key,
                 "facts_used": facts_used or [],
                 "attachments": list(attachments) if attachments else [],
+                "story_time": story_time,
             },
         )
         self.store.append_event(ev)
@@ -670,6 +672,7 @@ class StateManager:
             ConversationTurn(
                 n=turn_no,
                 ts=ev.ts,
+                story_time=story_time,
                 dir="out",
                 channel=channel,
                 body=body,
@@ -681,7 +684,13 @@ class StateManager:
         self._bump_and_save()
         return ev
 
-    def record_target_event(self, raw_event: dict[str, Any], *, default_channel: Channel) -> Event:
+    def record_target_event(
+        self,
+        raw_event: dict[str, Any],
+        *,
+        default_channel: Channel,
+        story_time: str | None = None,
+    ) -> Event:
         event_name = str(raw_event.get("type") or raw_event.get("event") or "unknown")
         raw_channel = str(raw_event.get("channel") or default_channel)
         channel: Channel = raw_channel if raw_channel in VALID_CHANNELS else default_channel  # type: ignore[assignment]
@@ -707,10 +716,14 @@ class StateManager:
 
         if event_name in {"reply", "persona_says"}:
             turn_no = len(self.snapshot.conversation.turns) + 1
+            resolved_story_time = (
+                str(raw_event.get("story_time") or "") or story_time or None
+            )
             self.snapshot.conversation.turns.append(
                 ConversationTurn(
                     n=turn_no,
                     ts=ev.ts,
+                    story_time=resolved_story_time,
                     dir="in",
                     channel=channel,
                     body=body,

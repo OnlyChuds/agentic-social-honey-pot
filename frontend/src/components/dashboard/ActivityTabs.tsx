@@ -155,8 +155,8 @@ function buildSafeEmailSrcDoc(
     "html,body{margin:0;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:#a1a1aa transparent;}",
     "::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrollbar-thumb{background:#a1a1aa;border-radius:9999px;}",
     isFullDoc
-      ? "body{background:#f3f4f6 !important;padding:14px 12px !important;}img{max-width:100%;height:auto;}"
-      : "body{padding:18px 20px;background:#f4f4f5;color:#18181b;font-family:Inter,system-ui,-apple-system,sans-serif;font-size:13px;line-height:1.55;}img{max-width:100%;height:auto;}",
+      ? "body{background:#f3f4f6 !important;padding:14px 12px !important;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif !important;}img{max-width:100%;height:auto;}"
+      : "body{padding:18px 20px;background:#f4f4f5;color:#18181b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.55;}img{max-width:100%;height:auto;}",
     "</style>",
   ].join("");
 

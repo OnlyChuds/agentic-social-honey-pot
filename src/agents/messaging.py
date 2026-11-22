@@ -248,6 +248,8 @@ def _compact_conversation_for_llm(snapshot: Snapshot) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     for turn in snapshot.conversation.turns[-12:]:
         item = turn.model_dump(mode="json")
+        if item.get("story_time"):
+            item["ts"] = item["story_time"]
         if isinstance(item.get("body"), str):
             item["body"] = _strip_html_for_context(item["body"])
         turns.append(item)
@@ -616,6 +618,7 @@ class MessagingAgent(BaseAgent):
         action_artifact: dict[str, Any] | None = None,
         objective: str | None = None,
         sender_alias: str | None = None,
+        win_goal_status: dict[str, Any] | None = None,
         live_turn_context: dict[str, Any] | None = None,
         branded_html: bool | None = None,
         portrait_ref: str | None = None,
@@ -680,6 +683,8 @@ class MessagingAgent(BaseAgent):
             context["email_style"] = email_style
         if effective_alias is not None:
             context["sender_alias"] = effective_alias
+        if win_goal_status is not None:
+            context["win_goal"] = win_goal_status
         if live_turn_context is not None:
             context["live_turn"] = live_turn_context
         if latest_signal is not None:
@@ -862,6 +867,7 @@ class MessagingAgent(BaseAgent):
         registered_page_url: str | None = None,
         channel_info: dict[str, Any] | None = None,
         sender_alias: str | None = None,
+        win_goal_status: dict[str, Any] | None = None,
         sent_at: str | None = None,
         auto_rewrite: bool = True,
     ) -> tuple[ConversationTurnDraft, Proposal]:
@@ -899,6 +905,7 @@ class MessagingAgent(BaseAgent):
             current_story_time=current_story_time or sent_at,
             channel_info=channel_info,
             sender_alias=sender_alias,
+            win_goal_status=win_goal_status,
             live_turn_context=live_turn_ctx,
             branded_html=False,
             auto_rewrite=auto_rewrite,
@@ -1022,6 +1029,7 @@ class MessagingAgent(BaseAgent):
                 registered_page_url=kwargs.get("registered_page_url"),
                 channel_info=kwargs.get("channel_info"),
                 sender_alias=kwargs.get("sender_alias"),
+                win_goal_status=kwargs.get("win_goal_status"),
                 sent_at=kwargs.get("sent_at"),
                 auto_rewrite=bool(kwargs.get("auto_rewrite", True)),
             )
@@ -1043,6 +1051,7 @@ class MessagingAgent(BaseAgent):
             action_artifact=kwargs.get("action_artifact"),
             objective=kwargs.get("objective"),
             sender_alias=kwargs.get("sender_alias"),
+            win_goal_status=kwargs.get("win_goal_status"),
             branded_html=kwargs.get("branded_html"),
             portrait_ref=kwargs.get("portrait_ref"),
             auto_rewrite=bool(kwargs.get("auto_rewrite", True)),

@@ -213,7 +213,7 @@ class RunManager:
         mode: str = "practice_live",
         stub_objective: str = "credentials",
         zero_pacing: bool = True,
-        aggressive: bool = False,
+        aggressive: bool = True,
         scenario: str = "practice",
         data_dir: Path | None = None,
     ) -> ActiveRunInfo:

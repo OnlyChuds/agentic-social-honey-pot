@@ -40,10 +40,14 @@ aim at. A wrong hook costs up to −5 points; a well-aimed one is the whole game
    A hook deflected twice goes `status: "exhausted"`. New candidate hooks are
    allowed only when grounded in a fact id.
 3. **Disclosure classification** (when a reply, call transcript, or `page_submissions`
-   contains non-public internal data): emit
+   contains strictly confidential, non-public internal data): emit
    `{"claim", "evidence_event", "confidence", "public_or_not"}`. The orchestrator
-   confirms at >= 0.7. Be strict about "non-public": not on the company website,
-   not in public talks or posts.
+   confirms at >= 0.7. Be VERY strict about `"non_public"`: high-level industry
+   opinions, general market commentary (e.g., works councils, GDPR, hiring, or
+   general security trends), and public product descriptions MUST be marked
+   `"public"` (or omitted). Only concrete internal secrets — unpublished revenue/
+   pricing figures, private customer lists, internal hostnames/architecture,
+   credentials/tokens, or confidential internal workflows — count as `"non_public"`.
 4. **Committed action classification** (`actions_taken` — ONLY when the target
    explicitly performed a concrete requested action in a reply or live call, such
    as approving a request/invoice, changing a payment detail, or granting access):

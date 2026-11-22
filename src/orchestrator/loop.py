@@ -130,6 +130,11 @@ class Orchestrator:
             "mentioned_dates": [],
             "subjects": [],
         }
+        self._funnel_state: dict[str, Any] = {
+            "links_sent": [],
+            "links_opened": [],
+            "step_up_submitted": [],
+        }
 
     def _sync_story_clock(self, iso_ts: str | None) -> None:
         """Advance the monotonic StoryClock forward if a remote story_time is ahead."""
@@ -172,9 +177,78 @@ class Orchestrator:
             if isinstance(ch, dict) and (ch.get("id") or ch.get("channel"))
         }
 
+    def _build_win_goal_status(
+        self,
+        *,
+        registered_url: str | None = None,
+        session_registered_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
+        urls = list(session_registered_urls or [])
+        if registered_url and registered_url not in urls:
+            urls.append(registered_url)
+        active_url = registered_url or (urls[-1] if urls else "")
+        links_opened = list(self._funnel_state["links_opened"])
+        step_up = list(self._funnel_state["step_up_submitted"])
+        links_sent = list(self._funnel_state["links_sent"])
+        remaining = max(
+            0, self.snapshot.campaign.budget.session_max - self.snapshot.campaign.budget.used
+        )
+
+        if step_up:
+            stage = "step_up_submitted"
+            directive = (
+                f"Step-up form submitted; route directly to {active_url or 'the portal URL'} "
+                "for final form submission (page.submitted)."
+            )
+        elif links_opened:
+            stage = "link_opened_not_submitted"
+            opened_u = links_opened[-1] or active_url
+            directive = (
+                f"Target already opened {opened_u} (link.opened). Resolve any hesitation "
+                f"and guide them to complete and submit the form on {active_url or opened_u}."
+            )
+        elif links_sent:
+            stage = "link_sent_unopened"
+            directive = (
+                f"Portal URL {active_url or links_sent[-1]} was already sent but not submitted. "
+                "Answer their question concisely and direct them to open and submit the form."
+            )
+        elif active_url:
+            stage = "ready_to_send_link"
+            directive = (
+                f"Include {active_url} naturally with a clear, concrete reason to sign in "
+                "and submit the portal form."
+            )
+        else:
+            stage = "link_not_sent_yet"
+            directive = (
+                "Build trust quickly and set up handoff to the registered portal page "
+                "to achieve page.submitted."
+            )
+
+        return {
+            "target_event": "page.submitted",
+            "required_objective": "credentials",
+            "stage": stage,
+            "active_url": active_url or None,
+            "registered_urls": urls,
+            "links_sent": links_sent,
+            "links_opened": links_opened,
+            "step_up_submitted": step_up,
+            "touches_remaining": remaining,
+            "directive": directive,
+        }
+
     def _strategy_context_kwargs(self) -> dict[str, Any]:
+        session_id = self.snapshot.sessions.current
+        reg_urls = (
+            [p.url for p in self.state.store.get_pages_for_session(session_id)]
+            if session_id
+            else []
+        )
         kwargs: dict[str, Any] = {
             "current_story_time": self.story_clock.current_iso,
+            "win_goal_status": self._build_win_goal_status(session_registered_urls=reg_urls),
         }
         if self._channels_catalog:
             kwargs["available_channels"] = self._channels_catalog
@@ -490,6 +564,27 @@ class Orchestrator:
             escalation=1,
         )
 
+    def _should_defer_live_call_to_email(self) -> bool:
+        """Avoid burning a live call when the target just asked for written details/email."""
+        inbound = [t for t in self.snapshot.conversation.turns if t.dir == "in"]
+        if not inbound:
+            return False
+        last_body = (inbound[-1].body or "").lower()
+        email_request_cues = (
+            "by mail",
+            "by email",
+            "over email",
+            "send me",
+            "send it over",
+            "send those over",
+            "one-pager",
+            "once my calendar settles",
+            "write you by mail",
+            "come back to you once",
+            "get back to you once",
+        )
+        return any(cue in last_body for cue in email_request_cues)
+
     def _build_landing_page_url(self, url_path: str) -> str:
         if url_path.startswith(("http://", "https://")):
             return url_path
@@ -681,7 +776,7 @@ class Orchestrator:
         asked_for_url = bool(
             last_in is not None
             and re.search(
-                r"\b(?:url|link|website|web\s*page|event\s+page|landing\s+page|registration\s+page|portal)\b",
+                r"\b(?:url|link|website|site|web\s*page|event\s+page|landing\s+page|registration\s+page|portal|one-?pager|deck|overview)\b",
                 last_in.body,
                 re.IGNORECASE,
             )
@@ -883,6 +978,7 @@ class Orchestrator:
         self._active_conversations[channel] = cid
 
         # Record opening persona greeting if returned
+        call_start_story_time = self.story_clock.current_iso
         last_persona_says = str(conv_res.get("persona_says") or "").strip()
         if last_persona_says:
             greeting_ev = self.state.record_target_event(
@@ -894,13 +990,18 @@ class Orchestrator:
                     "turn": 0,
                 },
                 default_channel=channel,
+                story_time=call_start_story_time,
             )
             recorded_events.append(greeting_ev)
             call_transcript.append({"speaker": "target", "turn": 0, "text": last_persona_says})
 
         for raw_ev in conv_res.get("events", []) or []:
             if isinstance(raw_ev, dict):
-                recorded_events.append(self.state.record_target_event(raw_ev, default_channel=channel))
+                recorded_events.append(
+                    self.state.record_target_event(
+                        raw_ev, default_channel=channel, story_time=call_start_story_time
+                    )
+                )
 
         touch_billed = False
         registered_pages = self.state.store.get_pages_for_session(session_id)
@@ -929,6 +1030,10 @@ class Orchestrator:
                         known_registered_urls=session_registered_urls,
                         channel_info=self._channels_by_id.get(channel),
                         sender_alias=touch_spec.sender_alias,
+                        win_goal_status=self._build_win_goal_status(
+                            registered_url=registered_url,
+                            session_registered_urls=session_registered_urls,
+                        ),
                         campaign_memory=dict(self._campaign_memory),
                         latest_signal=self._last_signal_payload,
                     )
@@ -972,6 +1077,7 @@ class Orchestrator:
                     facts_used=turn_facts,
                     attachments=turn_attachments,
                     cost_touch=not touch_billed,
+                    story_time=turn_sent_at,
                 )
                 if not touch_billed:
                     touch_billed = True
@@ -999,6 +1105,7 @@ class Orchestrator:
                             "turn": turn_idx,
                         },
                         default_channel=channel,
+                        story_time=turn_sent_at,
                     )
                     recorded_events.append(reply_ev)
                     call_transcript.append({"speaker": "target", "turn": turn_idx, "text": reply_text})
@@ -1008,7 +1115,9 @@ class Orchestrator:
                     for raw_ev in turn_events:
                         if isinstance(raw_ev, dict):
                             recorded_events.append(
-                                self.state.record_target_event(raw_ev, default_channel=channel)
+                                self.state.record_target_event(
+                                    raw_ev, default_channel=channel, story_time=turn_sent_at
+                                )
                             )
 
                 # Immediate win check on events emitted during this call turn
@@ -1114,6 +1223,16 @@ class Orchestrator:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(plan_prop)]))
 
         touch_spec = self._next_touch_spec()
+        if self.policy.is_live_channel(touch_spec.channel) and self._should_defer_live_call_to_email():
+            touch_spec = touch_spec.model_copy(
+                update={
+                    "channel": "email",
+                    "email_style": "personal_html",
+                    "intent": (
+                        f"Deliver requested written details by email first, then advance objective ({touch_spec.intent})"
+                    ),
+                }
+            )
         registered_url = await self._ensure_landing_page_registered(touch_spec.n, actions)
         session_registered_urls = [p.url for p in self.state.store.get_pages_for_session(session_id)]
         await self._maybe_upload_visual_proof(touch_spec)
@@ -1125,6 +1244,10 @@ class Orchestrator:
         channel_info = self._channels_by_id.get(touch_spec.channel)
 
         # Compose message (use live_turn mode for live voice/chat channels)
+        win_goal_status = self._build_win_goal_status(
+            registered_url=registered_url,
+            session_registered_urls=session_registered_urls,
+        )
         compose_mode = "live_turn" if self.policy.is_live_channel(touch_spec.channel) else "compose"
         msg_prop = await self._safe_run_agent(
             "messaging",
@@ -1141,6 +1264,7 @@ class Orchestrator:
             channel_info=channel_info,
             email_style=touch_spec.email_style,
             sender_alias=touch_spec.sender_alias,
+            win_goal_status=win_goal_status,
             action_artifact=active_plan.action_artifact if active_plan else None,
             objective=active_plan.objective if active_plan else None,
         )
@@ -1194,6 +1318,7 @@ class Orchestrator:
                     channel_info=channel_info,
                     email_style=touch_spec.email_style,
                     sender_alias=touch_spec.sender_alias,
+                    win_goal_status=win_goal_status,
                     action_artifact=active_plan.action_artifact if active_plan else None,
                     objective=active_plan.objective if active_plan else None,
                     qa_feedback=verdict.model_dump(mode="json", by_alias=True),
@@ -1272,6 +1397,7 @@ class Orchestrator:
                 channel_info=channel_info,
                 email_style=touch_spec.email_style,
                 sender_alias=touch_spec.sender_alias,
+                win_goal_status=win_goal_status,
                 action_artifact=active_plan.action_artifact if active_plan else None,
                 objective=active_plan.objective if active_plan else None,
                 latest_signal=self._last_signal_payload,
@@ -1413,6 +1539,7 @@ class Orchestrator:
                     facts_used=facts_used,
                     attachments=attachments,
                     cost_touch=True,
+                    story_time=contact_sent_at,
                 )
                 actions.append(
                     _action(
@@ -1428,7 +1555,9 @@ class Orchestrator:
                 if not isinstance(raw_events, list):
                     raw_events = []
                 recorded_events = [
-                    self.state.record_target_event(ev, default_channel=channel)
+                    self.state.record_target_event(
+                        ev, default_channel=channel, story_time=contact_sent_at
+                    )
                     for ev in raw_events
                     if isinstance(ev, dict)
                 ]
@@ -1546,12 +1675,27 @@ class Orchestrator:
             )
             return self.snapshot
 
+        # Track whether this touch carried a registered page URL
+        for u in session_registered_urls:
+            if u in body and u not in self._funnel_state["links_sent"]:
+                self._funnel_state["links_sent"].append(u)
+
         # Classify non-credential page submissions & intermediate step events (link/attachment opens)
         page_submissions: list[str] = []
         for ev in recorded_events:
             ev_kind = str(ev.payload.get("event") or "").strip().lower()
             if ev_kind in {"link.opened", "attachment.opened"}:
                 # Recorded as a positive step/momentum signal, NOT a terminal incident
+                if ev_kind == "link.opened":
+                    ev_data = ev.payload.get("data")
+                    opened_url = str(
+                        (ev_data.get("url") if isinstance(ev_data, dict) else "")
+                        or ev.payload.get("url")
+                        or registered_url
+                        or ""
+                    ).strip()
+                    if opened_url and opened_url not in self._funnel_state["links_opened"]:
+                        self._funnel_state["links_opened"].append(opened_url)
                 boosted_susp = max(0.0, self.policy.state.last_suspicion - 0.10)
                 self.policy.record_signal(
                     engagement=max(0.70, self.policy.state.last_engagement),
@@ -1564,6 +1708,15 @@ class Orchestrator:
                 if summary:
                     page_submissions.append(summary)
             elif sub_class == "step_up":
+                ev_data = ev.payload.get("data")
+                sub_url = str(
+                    (ev_data.get("url") if isinstance(ev_data, dict) else "")
+                    or ev.payload.get("url")
+                    or registered_url
+                    or ""
+                ).strip()
+                if sub_url and sub_url not in self._funnel_state["step_up_submitted"]:
+                    self._funnel_state["step_up_submitted"].append(sub_url)
                 summary = extract_page_submission_summary(ev)
                 if summary:
                     page_submissions.append(summary)
@@ -1628,13 +1781,16 @@ class Orchestrator:
                 if isinstance(raw_act, list):
                     action_candidates = [a for a in raw_act if isinstance(a, dict)]
 
-        # Check disclosure / committed action win
+        # Check disclosure / committed action win only when aligned with the active campaign objective
+        active_plan = self.snapshot.campaign.plan
+        allow_disclosure_win = active_plan is None or active_plan.objective == "disclosure"
+        allow_action_win = active_plan is None or active_plan.objective == "action"
         disc_win = evaluate_wins(
             [],
-            plan=self.snapshot.campaign.plan,
+            plan=active_plan,
             registered_pages=registered_pages,
-            disclosure_candidates=disclosure_candidates,
-            action_candidates=action_candidates,
+            disclosure_candidates=disclosure_candidates if allow_disclosure_win else None,
+            action_candidates=action_candidates if allow_action_win else None,
         )
         if disc_win is not None:
             self.state.record_incident(

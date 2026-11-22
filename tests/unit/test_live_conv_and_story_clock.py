@@ -389,6 +389,61 @@ async def test_cross_session_memory_persists_and_seeds_run2(tmp_path: Path) -> N
         store2.close()
 
 
+@pytest.mark.asyncio
+async def test_credentials_campaign_ignores_subjective_disclosure_false_win(tmp_path: Path) -> None:
+    mock_state = MockTargetState()
+    store = Store(tmp_path / "cred_no_false_disc.db")
+    api, http_client = _make_api(mock_state, store)
+
+    class _NoisyProfile:
+        async def run(self, snapshot: Snapshot, **kwargs: Any) -> Proposal:
+            return Proposal(
+                agent="profile",
+                kind="profile_update",
+                base_version=snapshot.version,
+                payload={
+                    "profile_update": Profile(overall_confidence=0.8).model_dump(mode="json"),
+                    "disclosures": [
+                        {
+                            "claim": "Works council alignment is a general adoption barrier",
+                            "evidence_event": "ev_1",
+                            "confidence": 0.9,
+                            "public_or_not": "non_public",
+                        }
+                    ],
+                },
+                rationale="noisy disclosure guess during credentials run",
+            )
+
+    stubs = build_stub_agents(objective="credentials", trigger_touch=3, assets_dir=tmp_path / "_a")
+    agents = AgentRegistry(
+        osint=stubs.osint,
+        identity=stubs.identity,
+        profile=_NoisyProfile(),
+        strategy=stubs.strategy,
+        messaging=stubs.messaging,
+        qa=stubs.qa,
+    )
+
+    try:
+        orch = Orchestrator(
+            config=_make_config(tmp_path),
+            state=StateManager(store),
+            api=api,
+            agents=agents,
+            policy=TriggerPolicy(min_gap_s=0.0),
+        )
+        await orch.bootstrap()
+        snap = await orch.step()
+        # Must NOT prematurely declare WIN on subjective disclosure during a credentials campaign
+        assert snap.run.state == "ENGAGE"
+        assert snap.incidents == []
+    finally:
+        await api.aclose()
+        await http_client.aclose()
+        store.close()
+
+
 def test_story_clock_rolls_weekends_to_monday_morning() -> None:
     from datetime import UTC, datetime
 

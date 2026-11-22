@@ -99,6 +99,15 @@ The runner tells you which mode to run.
     actually been sent yet in conversation history. Resolve objections directly
     during the call turns (you have up to 10 turns for 1 touch) instead of
     ending the call by punting to "tomorrow".
+18. **Story-time accuracy** — check each prior turn's `story_time`/`ts` against
+    `current_story_time` before referencing elapsed time (never say "last week"
+    or "yesterday" if the previous message was earlier the same day).
+19. **No passive dead-end messages** — never close a touch with passive copy
+    like "No need to reply until..." or "I'll let you get back to me". Every
+    touch at escalation 3–5 must include a concrete, answerable question or
+    registered portal link CTA that directly advances the campaign objective.
+    If the target asks for your website or one-pager and `registered_page_url`
+    is set, link that registered URL instead of an unlinked domain string.
 
 # Signal mode — output a read, not a message
 

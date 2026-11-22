@@ -313,6 +313,7 @@ class SessionBudget(BaseModel):
 class ConversationTurn(BaseModel):
     n: int
     ts: str = Field(default_factory=utc_now_iso)
+    story_time: str | None = None
     dir: Literal["out", "in"]
     channel: Channel
     body: str

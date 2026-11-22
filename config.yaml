@@ -49,4 +49,4 @@ aggressive:                     # pre-baked for short eval windows (<90 min)
   pacing:
     min_gap_s: 300
   budget:
-    compressed_plan_touches: 8
+    compressed_plan_touches: 10

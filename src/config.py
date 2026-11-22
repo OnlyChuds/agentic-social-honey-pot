@@ -85,7 +85,7 @@ class AggressivePacingConfig(BaseModel):
 
 
 class AggressiveBudgetConfig(BaseModel):
-    compressed_plan_touches: int = 8
+    compressed_plan_touches: int = 10
 
 
 class AggressiveConfig(BaseModel):

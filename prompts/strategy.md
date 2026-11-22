@@ -94,6 +94,23 @@ whole game.
     organization (the target can immediately detect nonexistent contracts or
     coworkers). Ground outreach in verifiable external events, public roles, or
     independent partner/ecosystem programs where we control all context.
+20. **No scheduling-only loops (execute the objective by Touch 3)**: spend at
+    most 1–2 touches on rapport/introductions. Starting at Touch 3, EVERY touch
+    must actively advance the declared objective rather than negotiating meeting
+    slots:
+    - For `credentials` (strong default when the target requests links, docs,
+      or verification materials): register a realistic portal/brief `landing_page`
+      (`["email", "password"]` or 2-step `pages[]`) with `trigger_touch: 3` so
+      any request for a website or document leads directly to the registered URL.
+    - For `disclosure`: ask specific, concrete non-public operational questions
+      directly in the thread/call (e.g. pricing tiers/ACV, internal deployment
+      stack, customer counts, roadmap milestones, internal tooling) AND still
+      declare a `disclosure_intake` landing page as a fallback if the target
+      asks for a link.
+    - For `action`: ask the target for a concrete verifiable operational action
+      (explicit approval, access grant, or payment/routing update).
+    Use the full available touch budget (`budget.remaining_to_plan`, up to 10
+    touches); never plan passive "wait for calendar" filler touches.
 
 # Output (compact minified JSON only, <=768 tokens, no indentation; conforms to `schemas/plan.json`; plan at most `budget.remaining_to_plan` touches [max 5] with concise <=10-word `intent` strings, <=6-word `stop_if` strings, and at most 2 short `pivot_triggers`)
 

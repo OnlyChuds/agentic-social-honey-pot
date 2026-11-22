@@ -251,18 +251,38 @@ def wrap_email_html(
     else:
         body_content = _linkify_html_fragment(body_content, accent)
 
+    portrait_html = ""
+    if portrait_ref:
+        safe_ref = html_lib.escape(portrait_ref, quote=True)
+        portrait_html = (
+            f'<td style="width:52px;vertical-align:top;padding-right:12px;">'
+            f'<img src="{safe_ref}" alt="{safe_sender}" '
+            f'style="width:44px;height:44px;border-radius:50%;object-fit:cover;'
+            f'object-position:center 20%;display:block;">'
+            f"</td>"
+        )
+
     if style == "personal_html":
         sig_inner = safe_signature_html or (
             f"{safe_sender}"
             + (f"<br>{safe_title}" if safe_title else "")
             + (f"<br>{safe_company}" if manifest.company else "")
         )
-        sig_block = (
-            f'<div style="margin-top:18px;font-size:13px;line-height:1.5;color:#4b5563;">'
-            f"{sig_inner}</div>"
-            if sig_inner
-            else ""
-        )
+        if sig_inner and portrait_html:
+            sig_block = (
+                '<table role="presentation" cellpadding="0" cellspacing="0" '
+                'style="margin-top:18px;">'
+                f"<tr>{portrait_html}"
+                f'<td style="font-size:13px;line-height:1.5;color:#4b5563;vertical-align:middle;">'
+                f"{sig_inner}</td></tr></table>"
+            )
+        elif sig_inner:
+            sig_block = (
+                f'<div style="margin-top:18px;font-size:13px;line-height:1.5;color:#4b5563;">'
+                f"{sig_inner}</div>"
+            )
+        else:
+            sig_block = ""
         return (
             "<!doctype html>"
             '<html lang="en">'
@@ -286,16 +306,6 @@ def wrap_email_html(
         if manifest.logo_svg.strip().startswith(("<svg", "<img"))
         else ""
     )
-    portrait_html = ""
-    if portrait_ref:
-        safe_ref = html_lib.escape(portrait_ref, quote=True)
-        portrait_html = (
-            f'<td style="width:56px;vertical-align:top;padding-right:12px;">'
-            f'<img src="{safe_ref}" alt="{safe_sender}" '
-            f'style="width:48px;height:48px;border-radius:50%;object-fit:cover;'
-            f'object-position:center 20%;display:block;">'
-            f"</td>"
-        )
 
     signature_section = ""
     if safe_signature_html or safe_sender:

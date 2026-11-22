@@ -182,6 +182,46 @@ def _clamp_plan_to_budget(
     return plan
 
 
+def _ensure_page_submission_goal(
+    plan: CampaignPlan,
+    snapshot: Snapshot,
+) -> CampaignPlan:
+    """Ensure credential plans target a registered landing page for `page.submitted`."""
+    if not plan.touches or plan.objective != "credentials":
+        return plan
+
+    valid_nums = [t.n for t in plan.touches]
+
+    all_pages = [*([plan.landing_page] if plan.landing_page is not None else []), *plan.pages]
+    has_secret_page = any(_has_credential_field(p.fields) for p in all_pages)
+
+    if plan.landing_page is None and not plan.pages:
+        company = (
+            snapshot.identity.company.strip()
+            if snapshot.identity is not None and snapshot.identity.company.strip()
+            else "Partner"
+        )
+        default_trigger = valid_nums[0] if snapshot.campaign.budget.used >= 2 else (
+            valid_nums[min(2, len(valid_nums) - 1)]
+        )
+        plan.landing_page = LandingPageSpec(
+            pretext=f"{company} Partner Portal Sign In",
+            fields=["email", "password"],
+            trigger_touch=default_trigger,
+            url_path="/partner-portal",
+        )
+    elif not has_secret_page:
+        target_page = plan.landing_page if plan.landing_page is not None else plan.pages[-1]
+        target_page.fields = ["email", "password"]
+
+    if plan.landing_page is not None and plan.landing_page.trigger_touch not in valid_nums:
+        plan.landing_page.trigger_touch = valid_nums[min(2, len(valid_nums) - 1)]
+    for page_spec in plan.pages:
+        if page_spec.trigger_touch not in valid_nums:
+            page_spec.trigger_touch = valid_nums[-1]
+    return plan
+
+
 class StrategyAgent(BaseAgent):
     """Campaign planner converting Profile, ranked Hooks, and remaining budget into a CampaignPlan."""
 
@@ -211,6 +251,7 @@ class StrategyAgent(BaseAgent):
         current_story_time: str | None = None,
         available_channels: list[dict[str, Any]] | None = None,
         target_memory: dict[str, Any] | None = None,
+        win_goal_status: dict[str, Any] | None = None,
         **_extra: Any,
     ) -> Proposal:
         del mode
@@ -332,10 +373,18 @@ class StrategyAgent(BaseAgent):
                 "give_up (str)",
                 "session_restart ({recommended: bool, reason: str | null})",
             ],
+            "win_goal": win_goal_status
+            or {
+                "target_event": "page.submitted",
+                "required_objective": "credentials",
+                "stage": "link_not_sent_yet",
+            },
             "instructions": (
                 "Return ONLY compact minified JSON (no indentation, <=768 tokens) with at most "
                 f"{max_touches} concise touches starting at n={used + 1}: <=10-word intent, "
-                "<=6-word stop_if, and <=2 short pivot_triggers."
+                "<=6-word stop_if, and <=2 short pivot_triggers. Always set objective='credentials' "
+                "with a non-null landing_page (fields=['email','password']) aimed at achieving a "
+                "page.submitted event."
             ),
         }
         if current_story_time:
@@ -419,6 +468,7 @@ class StrategyAgent(BaseAgent):
 
             if violations:
                 plan = _clamp_plan_to_budget(plan, snapshot, max_touches)
+            plan = _ensure_page_submission_goal(plan, snapshot)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Strategy LLM call failed (%s: %s); building deterministic fallback plan.",

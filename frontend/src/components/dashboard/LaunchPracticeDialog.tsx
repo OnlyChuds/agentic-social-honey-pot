@@ -31,7 +31,6 @@ export function LaunchPracticeDialog({ onLaunched }: LaunchPracticeDialogProps) 
   const [targetId, setTargetId] = useState("julius");
   const [customTarget, setCustomTarget] = useState("");
   const [zeroPacing, setZeroPacing] = useState(true);
-  const [aggressive, setAggressive] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,7 +48,7 @@ export function LaunchPracticeDialog({ onLaunched }: LaunchPracticeDialogProps) 
         target_id: resolvedTarget,
         mode: "practice_live",
         zero_pacing: zeroPacing,
-        aggressive,
+        aggressive: true,
       });
       setOpen(false);
       onLaunched(res);
@@ -126,15 +125,7 @@ export function LaunchPracticeDialog({ onLaunched }: LaunchPracticeDialogProps) 
               />
               Zero pacing
             </label>
-            <label className="flex cursor-pointer items-center gap-2 text-zinc-300">
-              <input
-                type="checkbox"
-                checked={aggressive}
-                onChange={(e) => setAggressive(e.target.checked)}
-                className="rounded border-zinc-700 bg-zinc-900 accent-zinc-100"
-              />
-              Aggressive budget
-            </label>
+            <span className="text-zinc-400">10-touch budget</span>
           </div>
 
           {error && (

@@ -340,6 +340,8 @@ def evaluate_wins(
         act = check_action_win(event, plan)
         if act is not None:
             return act
+    if plan is not None and plan.objective == "credentials":
+        return None
     committed_act = check_committed_action_win(action_candidates, threshold=action_threshold)
     if committed_act is not None:
         return committed_act
