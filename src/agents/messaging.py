@@ -113,6 +113,12 @@ class StoryClock:
         elif dt.hour >= self.work_end_hour:
             next_day = dt + timedelta(days=1)
             dt = next_day.replace(hour=self.work_start_hour, minute=15, second=0, microsecond=0)
+        # Never send business outreach on Saturday (5) or Sunday (6) — roll to Monday morning
+        if dt.weekday() >= 5:
+            days_until_monday = 7 - dt.weekday()
+            dt = (dt + timedelta(days=days_until_monday)).replace(
+                hour=self.work_start_hour, minute=15, second=0, microsecond=0
+            )
         return dt.replace(microsecond=0)
 
     @property
@@ -771,7 +777,7 @@ class MessagingAgent(BaseAgent):
                 draft.channel,
                 sender_alias=effective_alias,
             )
-        if sent_at is not None:
+        if sent_at is not None and not draft.sent_at:
             draft.sent_at = sent_at
 
         chosen_email_style: EmailStyle | None = email_style or (

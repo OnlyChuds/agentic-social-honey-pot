@@ -29,7 +29,7 @@ ASSET_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 class LaunchRunRequest(BaseModel):
     target_id: str
-    mode: Literal["mock_stub", "practice_live"] = "mock_stub"
+    mode: Literal["mock_stub", "practice_live"] = "practice_live"
     stub_objective: Literal["credentials", "action", "disclosure"] = "credentials"
     zero_pacing: bool = True
     aggressive: bool = False
@@ -228,6 +228,9 @@ def create_app(
         if not RUN_ID_RE.match(run_id):
             raise HTTPException(status_code=400, detail=f"Invalid run_id: {run_id!r}")
         stopped = manager.stop(run_id)
+        targets_cache["fp"] = None
+        targets_cache["data"] = None
+        detail_cache.pop(run_id, None)
         return {"run_id": run_id, "stopped": stopped}
 
     def api_create_offline_replay(_request: OfflineReplayRequest) -> dict[str, str]:

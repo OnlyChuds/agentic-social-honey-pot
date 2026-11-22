@@ -1,6 +1,5 @@
 "use client";
 
-import { AlertCircle, Terminal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityTabs } from "@/components/dashboard/ActivityTabs";
 import { KpiStrip } from "@/components/dashboard/KpiStrip";
@@ -13,6 +12,7 @@ import { VersionScrubber } from "@/components/dashboard/VersionScrubber";
 import { WatchoutsCard } from "@/components/dashboard/WatchoutsCard";
 import { fetchTargetDetail, fetchTargets, stopPracticeRun } from "@/lib/api";
 import type { LaunchRunResponse, TargetDetailResponse, TargetSummary } from "@/lib/types";
+import { isMockOrStubRun } from "@/lib/utils";
 
 export default function DashboardPage() {
   const [targets, setTargets] = useState<TargetSummary[]>([]);
@@ -28,6 +28,7 @@ export default function DashboardPage() {
 
   const selectedRunIdRef = useRef<string | null>(null);
   selectedRunIdRef.current = selectedRunId;
+  const mainScrollRef = useRef<HTMLElement | null>(null);
 
   const loadTargets = useCallback(async (preferredRunId?: string) => {
     try {
@@ -40,7 +41,10 @@ export default function DashboardPage() {
       if (desired && res.targets.some((t) => t.run_id === desired)) {
         setSelectedRunId(desired);
       } else if (res.targets.length > 0 && !desired) {
-        setSelectedRunId(res.targets[0].run_id);
+        // Prefer the most recent non-mock campaign by default
+        const sorted = [...res.targets].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+        const firstReal = sorted.find((t) => !isMockOrStubRun(t)) ?? sorted[0];
+        setSelectedRunId(firstReal.run_id);
       }
     } catch (err) {
       setError(
@@ -132,6 +136,7 @@ export default function DashboardPage() {
       return;
     }
     setIsLivePinned(true);
+    mainScrollRef.current?.scrollTo({ top: 0 });
     void loadDetail(selectedRunId);
   }, [selectedRunId, loadDetail]);
 
@@ -143,13 +148,17 @@ export default function DashboardPage() {
     }
   }, [isLivePinned, milestones]);
 
-  // Keyboard navigation for timeline scrubber
+  // Keyboard navigation for timeline scrubber (only when focus isn't inside an interactive widget)
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const target = e.target as HTMLElement | null;
       if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        e.target instanceof HTMLSelectElement
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable ||
+        target?.closest('[role="slider"], [role="tablist"], [role="tab"], [role="dialog"]')
       ) {
         return;
       }
@@ -215,6 +224,8 @@ export default function DashboardPage() {
       await stopPracticeRun(selectedRunId);
       await loadTargets(selectedRunId);
       await loadDetail(selectedRunId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to stop practice run");
     } finally {
       setStopping(false);
     }
@@ -238,7 +249,7 @@ export default function DashboardPage() {
     activeMilestone?.profile.overall_confidence ?? detail?.summary.profile_confidence ?? 0;
 
   return (
-    <div className="flex min-h-screen flex-col bg-[#09090B] lg:h-screen lg:flex-row lg:overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-background">
       <TargetSidebar
         targets={targets}
         selectedRunId={selectedRunId}
@@ -255,30 +266,39 @@ export default function DashboardPage() {
         isLoading={isLoading}
       />
 
-      <main className="flex-1 overflow-y-auto p-5 lg:p-7">
+      <main ref={mainScrollRef} className="flex-1 overflow-y-auto px-8 py-6">
         {error && (
-          <div className="mb-5 flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/70 px-4 py-2.5 text-xs text-zinc-300">
-            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
-            <span>{error} — ensure FastAPI backend is running (`uv run python -m src.web.server`).</span>
+          <div className="mx-auto mb-5 max-w-[1360px] rounded-lg border border-rose-900/50 bg-rose-950/20 px-4 py-2.5 text-xs text-rose-200">
+            {error} — ensure the FastAPI backend is running (
+            <code className="font-mono text-rose-100">uv run python -m src.web.server</code>).
           </div>
         )}
 
         {!detail ? (
-          <div className="flex h-[75vh] flex-col items-center justify-center rounded-xl border border-dashed border-zinc-800 bg-[#111114]/50 p-8 text-center">
-            <Terminal className="h-6 w-6 text-zinc-500" />
-            <h2 className="mt-3 text-sm font-medium text-zinc-200">
-              {isLoading ? "Loading campaigns..." : "No target campaign selected"}
-            </h2>
-            <p className="mt-1 max-w-md text-xs text-zinc-500">
-              Choose an existing run or use the sidebar to create one. You can also seed sample
-              replays:
-            </p>
-            <code className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-300">
-              uv run python -m src.web.demo_seed --data-dir data
-            </code>
-          </div>
+          isLoading ? (
+            <div className="mx-auto max-w-[1360px] space-y-5 animate-pulse">
+              <div className="h-20 rounded-xl bg-card" />
+              <div className="h-24 rounded-xl bg-card" />
+              <div className="h-12 rounded-xl bg-card" />
+              <div className="grid grid-cols-12 gap-5">
+                <div className="col-span-6 h-80 rounded-xl bg-card" />
+                <div className="col-span-6 h-80 rounded-xl bg-card" />
+              </div>
+            </div>
+          ) : (
+            <div className="mx-auto flex h-[75vh] max-w-[1360px] flex-col items-center justify-center rounded-xl border border-dashed border-zinc-800 bg-card/40 p-8 text-center">
+              <h2 className="text-sm font-medium text-zinc-200">No campaign selected</h2>
+              <p className="mt-1.5 max-w-md text-xs text-zinc-400">
+                Choose a campaign from the sidebar or start a practice run. To generate sample
+                replays, run:
+              </p>
+              <code className="mt-3 rounded-lg border border-zinc-800 bg-background px-3 py-1.5 font-mono text-xs text-zinc-300">
+                uv run python -m src.web.demo_seed --data-dir data
+              </code>
+            </div>
+          )
         ) : (
-          <div className="mx-auto max-w-[1320px] space-y-5">
+          <div className="mx-auto max-w-[1360px] space-y-5">
             <StagePipeline
               summary={detail.summary}
               stageHistory={detail.stage_history}
@@ -287,10 +307,13 @@ export default function DashboardPage() {
               stopping={stopping}
             />
 
-            <RunExecutionStatus
-              executionStatus={detail.execution_status}
-              state={detail.summary.state}
-            />
+            {detail.summary.is_running && (
+              <RunExecutionStatus
+                key={`exec-live-${detail.run_id}`}
+                executionStatus={detail.execution_status}
+                state={detail.summary.state}
+              />
+            )}
 
             <KpiStrip
               touchesUsed={
@@ -312,6 +335,7 @@ export default function DashboardPage() {
               milestones={milestones}
               selectedIndex={safeIdx}
               isLivePinned={isLivePinned}
+              isRunning={detail.summary.is_running}
               onSelectIndex={(idx) => {
                 setMilestoneIdx(idx);
                 setIsLivePinned(idx === milestones.length - 1);
@@ -323,9 +347,10 @@ export default function DashboardPage() {
             />
 
             {/* Primary Analytical Grid: Suspicion & Signals vs Personality Evolution */}
-            <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
-              <div className="space-y-5 xl:col-span-6">
+            <div className="grid grid-cols-12 items-start gap-5">
+              <div className="col-span-6 space-y-5">
                 <SuspicionChart
+                  key={`chart-${detail.run_id}`}
                   signals={detail.signal_series}
                   markers={detail.event_markers}
                   selectedVersion={displayedVersion}
@@ -333,32 +358,50 @@ export default function DashboardPage() {
                 />
                 <WatchoutsCard
                   watchouts={detail.watchout_history}
-                  activeWatchouts={activeMilestone?.profile.watchouts ?? detail.latest_snapshot.profile.watchouts}
+                  activeWatchouts={
+                    activeMilestone?.profile.watchouts ?? detail.latest_snapshot.profile.watchouts
+                  }
                   selectedVersion={displayedVersion}
                   onSelectVersion={handleSelectVersion}
                 />
               </div>
 
-              <div className="xl:col-span-6">
+              <div className="col-span-6">
                 <PersonalityEvolutionPanel
+                  key={`personality-${detail.run_id}`}
                   initialMilestone={initialMilestone}
                   currentMilestone={activeMilestone}
                   factsById={detail.facts_by_id}
+                  events={detail.events}
+                  onSelectVersion={handleSelectVersion}
                 />
               </div>
             </div>
 
             <ActivityTabs
+              key={`activity-${detail.run_id}`}
               runId={detail.run_id}
+              targetName={detail.summary.target_name || detail.summary.target_id}
+              senderName={detail.summary.sender_name}
+              selectedVersion={displayedVersion}
               turns={detail.turns}
               events={detail.events}
               decisions={detail.decisions}
               facts={detail.latest_snapshot.facts}
+              factsById={detail.facts_by_id}
               signals={detail.signal_series}
               registeredPages={detail.registered_pages}
               assetsById={detail.assets_by_id}
               onSelectVersion={handleSelectVersion}
             />
+
+            {!detail.summary.is_running && (
+              <RunExecutionStatus
+                key={`exec-done-${detail.run_id}`}
+                executionStatus={detail.execution_status}
+                state={detail.summary.state}
+              />
+            )}
           </div>
         )}
       </main>

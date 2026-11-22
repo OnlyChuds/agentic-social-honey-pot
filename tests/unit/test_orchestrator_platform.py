@@ -375,6 +375,7 @@ def test_win_detection_all_objectives() -> None:
     cred_win = check_credentials_win(ev_full, pages)
     assert cred_win is not None and cred_win.objective == "credentials"
 
+    # Per updated Target API scoring, attachment.opened is an intermediate step, NOT an incident
     plan_act = CampaignPlan(
         objective="action",
         action_artifact={"filename": "Invoice_4711.pdf"},
@@ -384,7 +385,20 @@ def test_win_detection_all_objectives() -> None:
         actor="target",
         payload={"event": "attachment.opened", "data": {"filename": "Invoice_4711.pdf"}},
     )
-    act_win = check_action_win(ev_act, plan_act)
+    assert check_action_win(ev_act, plan_act) is None
+
+    # Real action incident requires target committing an operational action (approval/access/payment)
+    from src.orchestrator.wins import check_committed_action_win
+
+    assert check_committed_action_win(
+        [{"action": "maybe later", "evidence_event": "e_10", "confidence": 0.9, "committed": False}]
+    ) is None
+    assert check_committed_action_win(
+        [{"action": "approved vendor", "evidence_event": "e_10", "confidence": 0.5, "committed": True}]
+    ) is None
+    act_win = check_committed_action_win(
+        [{"action": "approved vendor bank change", "evidence_event": "e_11", "confidence": 0.9, "committed": True}]
+    )
     assert act_win is not None and act_win.objective == "action"
 
     # Disclosure threshold & public filter

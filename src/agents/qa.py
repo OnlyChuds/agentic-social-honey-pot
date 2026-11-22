@@ -711,6 +711,7 @@ class QAAgent(BaseAgent):
         html: str,
         mode: RenderMode = "email",
         channel: str = "email",
+        email_style: str | None = None,
         asset_map: dict[str, Path] | None = None,
         save_screenshot_path: Path | None = None,
         page_url: str | None = None,
@@ -761,6 +762,7 @@ class QAAgent(BaseAgent):
             context_payload: dict[str, Any] = {
                 "channel": channel,
                 "render_mode": mode,
+                "email_style": email_style,
                 "reference_date": reference_date.isoformat() if reference_date else None,
                 "target": snapshot.target.model_dump(mode="json"),
                 "manifest": (
@@ -889,6 +891,7 @@ class QAAgent(BaseAgent):
             html=html,
             mode=mode,
             channel=str(kwargs.get("channel", "email")),
+            email_style=kwargs.get("email_style"),
             asset_map=asset_map,
             save_screenshot_path=kwargs.get("save_screenshot_path"),
             page_url=kwargs.get("page_url"),

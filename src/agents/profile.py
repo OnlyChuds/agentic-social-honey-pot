@@ -38,21 +38,31 @@ class DisclosureCandidate(BaseModel):
     public_or_not: Literal["non_public", "public", "uncertain"] = "uncertain"
 
 
+class ActionCandidate(BaseModel):
+    action: str
+    evidence_event: str
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    committed: bool = False
+
+
 class ProfileProposalPayload(BaseModel):
     profile_update: Profile = Field(default_factory=Profile)
     hook_updates: list[HookUpdate] = Field(default_factory=list)
     new_hooks: list[Hook] = Field(default_factory=list)
     disclosures: list[DisclosureCandidate] = Field(default_factory=list)
+    actions_taken: list[ActionCandidate] = Field(default_factory=list)
     rationale: str = ""
 
 
 def _enforce_profile_invariants(
     payload: ProfileProposalPayload,
     snapshot: Snapshot,
+    *,
+    extra_event_ids: set[str] | None = None,
 ) -> ProfileProposalPayload:
     active_fact_ids = {f.fact_id for f in snapshot.facts if f.status == "active"}
     event_refs = {t.event_ref for t in snapshot.conversation.turns if t.event_ref}
-    valid_anchors = active_fact_ids | event_refs
+    valid_anchors = active_fact_ids | event_refs | (extra_event_ids or set())
 
     # Enforce 2-deflection exhaustion rule and clamp engagement scores
     for upd in payload.hook_updates:
@@ -92,6 +102,9 @@ class ProfileAgent(BaseAgent):
         mode: str | None = None,
         psychoprofile_seeds: list[PsychTrait] | None = None,
         recent_signals: list[dict[str, Any]] | None = None,
+        page_submissions: list[str] | None = None,
+        call_transcript: list[dict[str, Any]] | None = None,
+        recent_events: list[dict[str, Any]] | None = None,
         **_extra: Any,
     ) -> Proposal:
         del mode
@@ -117,6 +130,7 @@ class ProfileAgent(BaseAgent):
                 "hook_updates (list of {hook_id, engagement: {touches_touched, positive, score}, status, rationale})",
                 "new_hooks (list of {hook_id, topic, evidence, why_leverage, confidence, status})",
                 "disclosures (list of {claim, evidence_event, confidence, public_or_not})",
+                "actions_taken (list of {action, evidence_event, confidence, committed: bool} — ONLY when target explicitly approved, granted access, or changed payment/vendor details; NEVER for link/attachment opens)",
                 "rationale (str)",
             ],
             "instructions": (
@@ -125,6 +139,16 @@ class ProfileAgent(BaseAgent):
                 "watchouts, <=1 new_hooks (or [] if existing hooks suffice), and hook_updates "
                 "only for hooks with new engagement evidence."
             ),
+        }
+        if page_submissions:
+            context["page_submissions"] = [s for s in page_submissions if s and s.strip()]
+        if call_transcript:
+            context["call_transcript"] = call_transcript[-20:]
+
+        extra_event_ids = {
+            str(ev.get("event_id"))
+            for ev in (recent_events or [])
+            if isinstance(ev, dict) and ev.get("event_id")
         }
 
         profile_max_tokens = min(self.prompt.max_tokens, _PROFILE_MAX_TOKENS)
@@ -155,7 +179,7 @@ class ProfileAgent(BaseAgent):
                 profile_update=fallback_prof,
                 rationale=f"Fallback profile after {type(exc).__name__}",
             )
-        payload = _enforce_profile_invariants(payload, snapshot)
+        payload = _enforce_profile_invariants(payload, snapshot, extra_event_ids=extra_event_ids)
 
         rationale = payload.rationale or (
             f"Updated profile (confidence={payload.profile_update.overall_confidence:.2f}), "

@@ -26,8 +26,12 @@ strict, specific, and cheap: concrete fixes, not opinions.
 # The four craft criteria — score each 0–2, exactly as the judges will
 
 1. **Sender authenticity (0–2):** does the artifact look like it was sent by the
-   claimed sender? Logo, branding, signature, and structural layout must match
-   the manifest and the claimed role. A vendor email with no branding = 0.
+   claimed sender? For `branded_card` formal notices, logo, branding, signature,
+   and structural layout must match the manifest and the claimed role. For
+   `personal_html` peer/reply emails (clean plain-looking business email with a
+   sender signature and no banner/logo header), omitting the corporate logo
+   banner is **intentional** — score it as an authentic personal business email
+   and do NOT fail or penalize it for missing `logo_svg`.
 2. **Format appropriateness (0–2):** does tone and formatting match the sender
    persona and the situation? A formal company email that looks like a chat
    message = 0. A landing page that looks like a marketing blog post = 1.

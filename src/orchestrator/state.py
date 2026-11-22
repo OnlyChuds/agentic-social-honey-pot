@@ -24,6 +24,7 @@ from src.models import (
     TargetInfo,
 )
 from src.store.db import Store
+from src.store.memory import TargetMemory
 
 VALID_CHANNELS: frozenset[str] = frozenset(get_args(Channel))
 
@@ -124,6 +125,90 @@ class StateManager:
         return self.snapshot.version
 
     # --- Setup & Session Lifecycle ---
+
+    def seed_from_memory(self, memory: TargetMemory) -> list[str]:
+        """Seed initial facts, hooks, and profile hints from cross-session TargetMemory."""
+        if memory.sessions_seen <= 0:
+            return []
+        seeded_sections: list[str] = []
+
+        if memory.verified_facts and not self.snapshot.facts:
+            self._merge_facts([f.model_copy(deep=True) for f in memory.verified_facts])
+            seeded_sections.append("facts")
+
+        if memory.hook_scoreboard and not self.snapshot.hooks:
+            seeded_hooks = [
+                Hook(
+                    hook_id=rec.hook_id,
+                    topic=rec.topic,
+                    evidence=list(rec.evidence),
+                    why_leverage=rec.why_leverage,
+                    confidence=rec.confidence,
+                    status=rec.status if rec.status in {"candidate", "active", "exhausted"} else "candidate",  # type: ignore[arg-type]
+                )
+                for rec in memory.hook_scoreboard.values()
+                if rec.topic
+            ]
+            if seeded_hooks:
+                self._merge_hooks(seeded_hooks)
+                seeded_sections.append("hooks")
+
+        prof_changed = False
+        if memory.watchouts:
+            seen = {w.strip().lower() for w in self.snapshot.profile.watchouts}
+            for w in memory.watchouts:
+                if w.strip() and w.strip().lower() not in seen:
+                    self.snapshot.profile.watchouts.append(w.strip())
+                    seen.add(w.strip().lower())
+                    prof_changed = True
+        if memory.style_guide and not self.snapshot.profile.style_guide:
+            self.snapshot.profile.style_guide = memory.style_guide
+            prof_changed = True
+        if memory.trust_style and not self.snapshot.profile.trust_style:
+            self.snapshot.profile.trust_style = memory.trust_style
+            prof_changed = True
+        if prof_changed:
+            seeded_sections.append("profile")
+
+        if seeded_sections:
+            self._bump_and_save()
+        return seeded_sections
+
+    def reconcile_remote_session(
+        self,
+        remote_session: dict[str, Any],
+        remote_events: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Reconcile local snapshot counters against remote Target API session state on resume."""
+        changed = False
+        remote_touches = remote_session.get("touches_used")
+        if isinstance(remote_touches, int) and remote_touches > self.snapshot.campaign.budget.used:
+            self.snapshot.campaign.budget.used = remote_touches
+            changed = True
+
+        if remote_session.get("ended") is True and self.snapshot.run.state == "ENGAGE":
+            self.snapshot.run.state = "DONE"
+            changed = True
+
+        if remote_events:
+            existing_bodies = {
+                (t.dir, t.channel, t.body) for t in self.snapshot.conversation.turns
+            }
+            for raw_ev in remote_events:
+                if not isinstance(raw_ev, dict):
+                    continue
+                ev_type = str(raw_ev.get("type") or raw_ev.get("event") or "")
+                body = str(raw_ev.get("body") or raw_ev.get("text") or raw_ev.get("say") or "")
+                ch_raw = str(raw_ev.get("channel") or "email")
+                ch: Channel = ch_raw if ch_raw in VALID_CHANNELS else "email"  # type: ignore[assignment]
+                if ev_type in {"reply", "persona_says"} and ("in", ch, body) not in existing_bodies:
+                    self.record_target_event(raw_ev, default_channel=ch)
+                    existing_bodies.add(("in", ch, body))
+                    changed = True
+
+        if changed:
+            self._bump_and_save()
+        return changed
 
     def configure_run(
         self,
@@ -620,7 +705,7 @@ class StateManager:
         )
         self.store.append_event(ev)
 
-        if event_name == "reply":
+        if event_name in {"reply", "persona_says"}:
             turn_no = len(self.snapshot.conversation.turns) + 1
             self.snapshot.conversation.turns.append(
                 ConversationTurn(

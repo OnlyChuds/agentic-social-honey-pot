@@ -130,26 +130,26 @@ Pinning these signatures ensures Wave 1 workers build cleanly in parallel withou
   - `src/agents/visual_artifacts.py`: Playwright `render_visual_artifact_png()` one-pager/agenda renderer.
   - `src/agents/qa.py`: speaker/panelist/org placeholder detection + deterministic `check_past_dates(..., reference_date=...)` wired into `run_deterministic_checks`, `QAAgent.evaluate`, `QAAgent.run`, and `run_qa_loop`.
   - `tests/unit/test_craft_pages_qa.py` & `tests/unit/test_landing_pages_qa.py`: unit + Playwright coverage verified.
-- **Workstream D (`agents-prompts`) — Partially Complete**
+- **Workstream D (`agents-prompts`) — Code & Tests Complete**
   - `src/models.py`: added `EmailStyle`, `SystemSenderAlias`, `BrandingManifest.system_senders`, `CampaignPlan.pages`, `TouchSpec.email_style` / `sender_alias` / `story_delay_minutes`.
   - `src/agents/messaging.py`: upgraded 22-channel `resolve_sender_for_channel(..., sender_alias=...)`, `ConversationTurnDraft.hang_up`, `compose()` wiring (`current_story_time`, `channel_info`, `email_style`, `objective`, `action_artifact`, `sender_alias`, adaptive `personal_html` vs `branded_card`), and `compose_live_turn()` (`persona_says`, `turn_index`, `current_story_time`, `registered_page_url`, `hang_up`).
+  - `src/agents/strategy.py`: forwards `current_story_time`, `available_channels`, and `target_memory`; validates and clamps multi-page `plan.pages` alongside `plan.landing_page`.
+  - `src/agents/profile.py`: accepts `page_submissions`, `call_transcript`, and `recent_events` anchors for disclosure extraction.
+  - `tests/unit/test_agents_api_leverage.py`: unit coverage verified.
+- **Workstream E (`orchestrator-wire`) — Complete**
+  - `src/orchestrator/loop.py`, `src/orchestrator/state.py`, `src/main.py`:
+    - Interactive 10-turn live conversation loop (`_execute_live_conversation`: 1 touch billed on `start_conversation`, up to 10 turns at 0 extra touches and 0 inter-turn pacing sleep, `persona_says` recording, `ConversationEndedError` handling, `end_conversation()`, `call_transcript` passed to `ProfileAgent`).
+    - Wired `StoryClock` (`sent_at` on messages/calls/turns, sync from `story_time` on `--resume`, automatic recovery on `StoryTimeError`, `current_story_time` / `reference_date` forwarded to Strategy, Messaging, and QA).
+    - Wired multi-page registration / URL replacement (`plan.pages`, `force=True`) and on-demand Playwright PNG briefing sheet upload (`render_visual_artifact_png`).
+    - Wired `classify_page_submission()` & `extract_page_submission_summary()` (`disclosure_candidate` → `ProfileAgent`, `step_up` → trust boost without premature termination).
+    - Wired `TargetMemoryStore` (`seed_from_memory` on bootstrap, `update_from_snapshot()` on exit).
+    - Session hygiene: cached `GET /v1/channels`, remote session reconciliation on `--resume`, and clean `end_session()` on `WIN`/`DONE`.
+  - `tests/unit/test_live_conv_and_story_clock.py`: end-to-end integration tests verified.
+- **Wave 3 Offline Verification — Complete**
+  - `uv run pytest`: **126 passed** (0 failures).
+  - `uv run ruff check src/ tests/`: **All checks passed**.
 
-### Remaining
+### Remaining (Optional)
 
-- **Workstream D (`agents-prompts`) — Remaining items**
-  - `src/agents/strategy.py`: accept and pass `current_story_time`, `available_channels`, and `target_memory` in Strategy context; validate/support `plan.pages`.
-  - `src/agents/profile.py`: accept `page_submissions` and `call_transcript` in `run()` for disclosure extraction.
-  - `prompts/strategy.md` & `prompts/messaging.md`: add rules for 10-turns-for-1-touch live calls, date grounding vs `current_story_time`, web fact-check anti-hallucination, `mfa_push` priming, disclosure intake forms, and `email_style` selection.
-  - `tests/unit/test_agents_api_leverage.py`: unit tests for Workstream D additions.
-- **Workstream E (`orchestrator-wire`) — Not started**
-  - `src/orchestrator/loop.py`, `src/orchestrator/state.py`, `src/orchestrator/policy.py`, `src/main.py`:
-    - Interactive 10-turn live conversation loop (1 touch billed on `start_conversation`, up to 10 turns at 0 extra touches, no inter-turn `min_gap_s`, `end_conversation()`, feed `call_transcript` to `ProfileAgent`).
-    - Wire `StoryClock` (`sent_at` on messages/calls/turns, sync from `story_time` on `--resume`, recover on `StoryTimeError`, pass `current_story_time` / `reference_date` to Strategy/Messaging/QA).
-    - Wire multi-page registration / URL replacement (`plan.pages`, `force=True`) and on-demand PNG visual artifact upload.
-    - Wire `classify_page_submission()` (`disclosure_candidate` → `ProfileAgent`, `step_up` → trust boost without premature win).
-    - Wire `TargetMemoryStore` load on bootstrap and `update_from_snapshot()` on exit.
-    - Session hygiene: cache `GET /v1/channels` on boot, handle disambiguated `409`s cleanly, reconcile `--resume` via `GET /v1/sessions/{sid}` + `/events`, and call `end_session()` on `WIN`/`DONE`.
-  - `tests/unit/test_live_conv_and_story_clock.py`: integration tests for live calls, `StoryClock`, page submission classification, and cross-run memory.
-- **Wave 3 Verification — Not started**
-  - Full offline `pytest` + `ruff` + E2E mock suite.
-  - Optional live `practice` smoke test (`julius` / `tom`, 0 `eval` touches).
+- **Prompt wording refinements**: `prompts/strategy.md` and `prompts/messaging.md` can optionally be expanded with explicit natural-language guidance for the newly wired fields (`available_channels`, `target_memory`, `current_story_time`, `pages`, `email_style`, and multi-turn live calls).
+- **Live practice smoke test**: optional live check against `target-api` (`julius` / `tom`, 0 `eval` touches) to confirm non-null `story_time`, live multi-turn call recording, and `status: "ended"` on exit.

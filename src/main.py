@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import importlib
 import inspect
+import signal
 import struct
 import zlib
 from pathlib import Path
@@ -151,15 +152,32 @@ class _StubProfileAgent:
     async def run(self, snapshot: Snapshot, **kwargs: Any) -> Proposal:
         recent_events = kwargs.get("recent_events") or []
         disclosures: list[dict[str, Any]] = []
+        actions_taken: list[dict[str, Any]] = []
+        is_action_obj = (
+            snapshot.campaign.plan is not None and snapshot.campaign.plan.objective == "action"
+        )
         for ev in recent_events:
             body = str(ev.get("payload", {}).get("body", ""))
-            if "internal-" in body.lower():
+            lower = body.lower()
+            if "internal-" in lower:
                 disclosures.append(
                     {
                         "claim": body,
                         "evidence_event": ev.get("event_id", ""),
                         "confidence": 0.85,
                         "public_or_not": False,
+                    }
+                )
+            if is_action_obj and any(
+                kw in lower
+                for kw in ("right away", "taking care of it", "approved", "granted", "updated payment")
+            ):
+                actions_taken.append(
+                    {
+                        "action": body,
+                        "evidence_event": ev.get("event_id", ""),
+                        "confidence": 0.9,
+                        "committed": True,
                     }
                 )
         profile = Profile(
@@ -175,6 +193,7 @@ class _StubProfileAgent:
                 "profile_update": profile.model_dump(mode="json"),
                 "hook_updates": [],
                 "disclosure_candidates": disclosures,
+                "actions_taken": actions_taken,
             },
             rationale="stub profile synthesis",
         )
@@ -259,6 +278,38 @@ class _StubMessagingAgent:
                     "reason": "stub signal evaluation",
                 },
                 rationale="stub signal read",
+            )
+
+        if mode == "live_turn":
+            touch = kwargs.get("touch") or {}
+            channel = str(kwargs.get("channel") or touch.get("channel") or "phone_call")
+            turn_idx = int(kwargs.get("turn_index", 1))
+            registered_url = kwargs.get("registered_page_url")
+            active_facts = [f.fact_id for f in snapshot.facts if f.status == "active"][:1]
+            say_text = (
+                f"Hi {snapshot.target.name or snapshot.target.id}, thanks for taking a quick call."
+                if turn_idx == 1
+                else (
+                    f"Great, I just shared the confirmation link at {registered_url}."
+                    if registered_url
+                    else "Understood, could you share which internal system handles that?"
+                )
+            )
+            return Proposal(
+                agent="messaging",
+                kind="message",
+                base_version=snapshot.version,
+                payload={
+                    "mode": "compose",
+                    "channel": channel,
+                    "body": say_text,
+                    "say": say_text,
+                    "attachments": [],
+                    "page_request": str(registered_url) if registered_url and turn_idx > 1 else None,
+                    "facts_used": active_facts,
+                    "hang_up": turn_idx >= 3,
+                },
+                rationale=f"stub live turn {turn_idx}",
             )
 
         touch = kwargs.get("touch") or {}
@@ -488,8 +539,24 @@ async def run_from_args(args: argparse.Namespace) -> Snapshot:
                 agents=agents,
                 policy=policy,
                 aggressive=args.aggressive,
+                renderer=renderer,
             )
-            final_snapshot = await orch.run(max_cycles=args.max_cycles)
+            current_task = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            sig_installed = False
+            if current_task is not None:
+                try:
+                    loop.add_signal_handler(signal.SIGTERM, current_task.cancel)
+                    sig_installed = True
+                except (NotImplementedError, RuntimeError):
+                    sig_installed = False
+            try:
+                final_snapshot = await orch.run(max_cycles=args.max_cycles)
+            except asyncio.CancelledError:
+                final_snapshot = state.snapshot
+            finally:
+                if sig_installed:
+                    loop.remove_signal_handler(signal.SIGTERM)
 
         return final_snapshot
     finally:

@@ -19,25 +19,32 @@ export function WatchoutsCard({
   const byText = new Map(watchouts.map((w) => [w.text, w]));
 
   return (
-    <Card className="border-zinc-800/80">
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium text-zinc-100">Suspicion Watchouts</CardTitle>
+    <Card>
+      <CardHeader className="flex-row items-baseline justify-between space-y-0 pb-2.5">
+        <CardTitle>Suspicion Watchouts</CardTitle>
+        {activeWatchouts.length > 0 && (
+          <span className="text-xs text-zinc-400">Click version to inspect origin</span>
+        )}
       </CardHeader>
       <CardContent>
         {activeWatchouts.length === 0 ? (
-          <p className="text-xs text-zinc-500">None observed up to v{selectedVersion}.</p>
+          <p className="text-xs text-zinc-400">No watchouts observed up to v{selectedVersion}.</p>
         ) : (
           <ul className="divide-y divide-zinc-800/70">
             {activeWatchouts.map((text) => {
               const meta = byText.get(text);
               return (
-                <li key={text} className="flex items-center justify-between gap-3 py-2 text-xs">
-                  <span className="text-zinc-300">{text}</span>
+                <li
+                  key={text}
+                  className="flex items-baseline justify-between gap-4 py-2.5 text-[13px] leading-snug"
+                >
+                  <span className="text-zinc-200">{text}</span>
                   {meta && (
                     <button
                       type="button"
                       onClick={() => onSelectVersion?.(meta.first_seen_version)}
-                      className="shrink-0 font-mono text-[11px] text-zinc-500 hover:text-zinc-200 cursor-pointer"
+                      title={`Jump timeline to v${meta.first_seen_version}`}
+                      className="shrink-0 cursor-pointer font-mono text-xs tabular-nums text-zinc-400 transition-colors hover:text-zinc-100"
                     >
                       v{meta.first_seen_version}
                     </button>

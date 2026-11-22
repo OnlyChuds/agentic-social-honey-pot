@@ -447,6 +447,7 @@ async def test_role1_role3_live_channel_phone_sender_and_sent_at(tmp_path: Path)
                         "body": "Hi Julius, quick call about Thursday's Munich speaker timing.",
                         "sent_at": "2026-11-22T10:15:00+01:00",
                         "facts_used": [],
+                        "hang_up": True,
                     }
                 )
             ),

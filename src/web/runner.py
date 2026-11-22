@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import atexit
+import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -13,7 +15,8 @@ from typing import Any
 
 import httpx
 
-from src.models import utc_now_iso
+from src.models import Event, utc_now_iso
+from src.store.db import Store
 
 TARGET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 VALID_MODES: frozenset[str] = frozenset({"mock_stub", "practice_live"})
@@ -207,7 +210,7 @@ class RunManager:
         self,
         *,
         target_id: str,
-        mode: str = "mock_stub",
+        mode: str = "practice_live",
         stub_objective: str = "credentials",
         zero_pacing: bool = True,
         aggressive: bool = False,
@@ -272,7 +275,6 @@ class RunManager:
                     str(run_no),
                     "--data-dir",
                     str(target_dir),
-                    "--stub-missing-agents",
                 ]
 
             if zero_pacing:
@@ -307,19 +309,124 @@ class RunManager:
             self._runs[run_id] = _TrackedRun(info=info, process=proc)
             return info
 
+    @staticmethod
+    def _find_external_pids(run_id: str) -> list[int]:
+        """Find alive external ``src.main`` PIDs matching ``<scenario>_<target>_run<N>``."""
+        m = re.match(r"^(practice|eval)_([A-Za-z0-9_-]+)_run(\d+)$", run_id)
+        if not m:
+            return []
+        scenario, target_id, run_no = m.group(1), m.group(2), m.group(3)
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return []
+
+        def _flag_val(argv: list[str], flag: str) -> str | None:
+            for idx, tok in enumerate(argv):
+                if tok == flag and idx + 1 < len(argv):
+                    return argv[idx + 1]
+                if tok.startswith(f"{flag}="):
+                    return tok.split("=", 1)[1]
+            return None
+
+        my_pid = os.getpid()
+        matched: list[int] = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == my_pid:
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            parts = [p.decode("utf-8", errors="ignore") for p in raw.split(b"\x00") if p]
+            if "src.main" not in parts:
+                continue
+
+            if (
+                _flag_val(parts, "--target") == target_id
+                and (_flag_val(parts, "--run-no") or "1") == run_no
+                and (_flag_val(parts, "--scenario") or "practice") == scenario
+            ):
+                matched.append(pid)
+        return matched
+
+    @staticmethod
+    def _terminate_pid(pid: int, timeout: float = 3.0) -> bool:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.1)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return True
+
+    @staticmethod
+    def _mark_db_stopped(db_path: Path) -> bool:
+        """Record a clean ``run_exit(stopped)`` event so stopped/orphaned runs never stay 'Live'."""
+        if not db_path.is_file():
+            return False
+        try:
+            with Store(db_path) as store:
+                latest = store.latest_snapshot()
+                events = store.get_events()
+                has_exit = any(
+                    ev.type == "system" and ev.payload.get("kind") == "run_exit"
+                    for ev in events
+                )
+                is_terminal = latest is not None and latest.run.state in {"WIN", "DONE", "ABORT"}
+                if has_exit and is_terminal:
+                    return False
+
+                base_ver = latest.version if latest is not None else 0
+                if not has_exit:
+                    store.append_event(
+                        Event(
+                            type="system",
+                            actor="orchestrator",
+                            base_version=base_ver,
+                            payload={"kind": "run_exit", "reason": "stopped"},
+                        )
+                    )
+                if latest is not None and latest.run.state not in {"WIN", "DONE", "ABORT"}:
+                    latest.run.state = "DONE"
+                    latest.version += 1
+                    store.save_snapshot(latest)
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def stop(self, run_id: str) -> bool:
-        """Stop a running background campaign process by run_id."""
+        """Stop a running background or external campaign process and mark its DB stopped."""
         with self._lock:
+            terminated = False
             entry = self._runs.get(run_id)
-            if entry is None:
-                return False
-            self._refresh_entry(entry)
-            if entry.process.poll() is not None:
-                return False
-            entry.stopped_by_user = True
-            self._terminate_proc(entry.process)
-            self._refresh_entry(entry)
-            return True
+            if entry is not None:
+                self._refresh_entry(entry)
+                if entry.process.poll() is None:
+                    entry.stopped_by_user = True
+                    self._terminate_proc(entry.process)
+                    self._refresh_entry(entry)
+                    terminated = True
+
+            for ext_pid in self._find_external_pids(run_id):
+                if self._terminate_pid(ext_pid):
+                    terminated = True
+
+            db_marked = self._mark_db_stopped(self.data_dir / f"{run_id}.db")
+            return terminated or db_marked
 
     def list_runs(self) -> list[dict[str, Any]]:
         """Return all tracked runs with refreshed process status."""

@@ -28,46 +28,67 @@ export function KpiStrip({
   const suspBand = getSuspicionBand(suspicion);
 
   return (
-    <div className="grid grid-cols-2 gap-y-4 rounded-xl border border-zinc-800/80 bg-[#111114] px-5 py-4 sm:grid-cols-5 sm:divide-x sm:divide-zinc-800/80">
-      <div className="sm:pr-4">
-        <p className="text-[11px] text-zinc-500">Touches</p>
-        <p className="mt-1 font-mono text-xl font-medium tabular-nums text-zinc-100">
+    <div className="grid grid-cols-5 divide-x divide-zinc-800/80 rounded-xl border border-zinc-800/80 bg-card px-4 py-4">
+      <div className="min-w-0 pr-4">
+        <p className="truncate text-xs text-zinc-400">Touches</p>
+        <p className="mt-1.5 font-mono text-2xl font-semibold tabular-nums text-zinc-50">
           {touchesUsed}
-          <span className="text-sm text-zinc-500">/{sessionMax}</span>
+          <span className="text-base font-normal text-zinc-500">/{sessionMax}</span>
         </p>
         {incidentsCount > 0 && (
-          <p className="mt-0.5 text-[11px] text-emerald-400">Objective met</p>
+          <p className="mt-1 text-xs text-emerald-400">Objective met</p>
         )}
       </div>
 
-      <div className="sm:px-4">
-        <p className="text-[11px] text-zinc-500">Sessions</p>
-        <p className="mt-1 font-mono text-xl font-medium tabular-nums text-zinc-100">
+      <div className="min-w-0 px-4">
+        <p className="truncate text-xs text-zinc-400">Sessions</p>
+        <p className="mt-1.5 font-mono text-2xl font-semibold tabular-nums text-zinc-50">
           {sessionsUsed}
-          <span className="text-sm text-zinc-500">/{sessionsAllowed}</span>
+          <span className="text-base font-normal text-zinc-500">/{sessionsAllowed}</span>
         </p>
-        {sessionsUsed > 1 && <p className="mt-0.5 text-[11px] text-zinc-400">Memory retained</p>}
+        {sessionsUsed > 1 && <p className="mt-1 truncate text-xs text-zinc-400">Memory retained</p>}
       </div>
 
-      <div className="sm:px-4">
-        <p className="text-[11px] text-zinc-500">Suspicion</p>
-        <p className={cn("mt-1 font-mono text-xl font-medium tabular-nums", suspBand.textClass)}>
+      <div className="min-w-0 px-4">
+        <p className="truncate text-xs text-zinc-400">Suspicion</p>
+        <p
+          className={cn(
+            "mt-1.5 font-mono text-2xl font-semibold tabular-nums",
+            suspicion === null ? "text-zinc-500" : suspBand.textClass
+          )}
+        >
           {formatScore(suspicion)}
         </p>
-        <p className="mt-0.5 text-[11px] text-zinc-500">{suspBand.label}</p>
+        <p
+          className={cn(
+            "mt-1 truncate text-xs",
+            suspicion !== null && suspicion >= 0.6 ? "text-rose-400/90" : "text-zinc-400"
+          )}
+        >
+          {suspBand.label}
+        </p>
       </div>
 
-      <div className="sm:px-4">
-        <p className="text-[11px] text-zinc-500">Engagement</p>
-        <p className="mt-1 font-mono text-xl font-medium tabular-nums text-zinc-100">
+      <div className="min-w-0 px-4">
+        <p className="truncate text-xs text-zinc-400">Engagement</p>
+        <p
+          className={cn(
+            "mt-1.5 font-mono text-2xl font-semibold tabular-nums",
+            engagement === null ? "text-zinc-500" : "text-zinc-50"
+          )}
+        >
           {formatScore(engagement)}
         </p>
-        {mood && <p className="mt-0.5 truncate text-[11px] text-zinc-500">{mood}</p>}
+        {mood && (
+          <p className="mt-1 truncate text-xs text-zinc-400" title={mood}>
+            {mood.split(";")[0].trim()}
+          </p>
+        )}
       </div>
 
-      <div className="col-span-2 sm:col-span-1 sm:pl-4">
-        <p className="text-[11px] text-zinc-500">Profile Confidence</p>
-        <p className="mt-1 font-mono text-xl font-medium tabular-nums text-zinc-100">
+      <div className="min-w-0 pl-4">
+        <p className="truncate text-xs text-zinc-400">Profile confidence</p>
+        <p className="mt-1.5 font-mono text-2xl font-semibold tabular-nums text-zinc-50">
           {formatPercent(profileConfidence)}
         </p>
       </div>
