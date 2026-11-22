@@ -339,21 +339,21 @@ async def test_strategy_agent_validates_and_repairs_budget_and_hooks() -> None:
                 channel="linkedin_message" if i <= 2 else "email",
                 intent=f"touch {i}",
                 hook="h_1",
-                escalation=[1, 2, 2, 3, 3, 3, 4, 4, 5, 5][i - 1],
+                escalation=[1, 2, 3, 4, 5][i - 1],
                 stop_if="explicit decline",
             )
-            for i in range(1, 11)
+            for i in range(1, 6)
         ],
         landing_page=LandingPageSpec(
             pretext="Partner portal login",
             fields=["email", "password"],
-            trigger_touch=7,
+            trigger_touch=3,
             url_path="/partner-portal",
         ),
         pivot_triggers=["2 touches no reply", "suspicion >= 0.6"],
-        give_up="touch 9 without response",
+        give_up="touch 5 without response",
     )
-    assert validate_campaign_plan(good_plan, snap, max_touches=10) == []
+    assert validate_campaign_plan(good_plan, snap, max_touches=5) == []
 
     llm.complete_json = AsyncMock(side_effect=[bad_plan, good_plan])  # type: ignore[method-assign]
     agent = StrategyAgent(llm)
@@ -361,9 +361,9 @@ async def test_strategy_agent_validates_and_repairs_budget_and_hooks() -> None:
     assert prop.agent == "strategy"
     assert prop.kind == "plan"
     assert llm.complete_json.call_count == 2
-    assert len(prop.payload["touches"]) == 10
+    assert len(prop.payload["touches"]) == 5
     assert prop.payload["primary_hook"] == "h_1"
-    assert prop.payload["landing_page"]["trigger_touch"] == 7
+    assert prop.payload["landing_page"]["trigger_touch"] == 3
     await llm.aclose()
 
 
@@ -618,6 +618,71 @@ async def test_osint_agent_caches_dossier_per_person_and_bypasses_on_refresh(tmp
     assert llm.complete_json.call_count == 2
     assert "cached" not in p3.rationale.lower()
     await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tightened_output_token_budgets_and_strategy_touch_cap() -> None:
+    import json
+
+    snap = _sample_snapshot(scenario="practice", session_max=30, used=0)
+    llm = TextLLMClient(base_url="https://llm.test/v1", api_key="k")
+
+    # 1) OSINT: 900 tok budget
+    eng = OsintEngine(tavily_key="k", max_budget_usd=1.0)
+    eng.run = AsyncMock(  # type: ignore[method-assign]
+        return_value=OsintResult(
+            sources=[Source(provider="tavily", kind="search", label="p", url="https://revel8.ai", title="Bio", text="Co-CEO", ok=True)],
+            org_domain="revel8.ai",
+            budget_usd=0.01,
+        )
+    )
+    osint_agent = OSINTAgent(llm, engine=eng, use_cache=False)
+    assert osint_agent.prompt.max_tokens == 900
+    llm.complete_json = AsyncMock(return_value=DossierPayload(completeness="partial"))  # type: ignore[method-assign]
+    await osint_agent.run(snap, mode="bootstrap")
+    assert llm.complete_json.call_args.kwargs["max_tokens"] == 900
+
+    # 2) Profile: 512 tok budget
+    profile_agent = ProfileAgent(llm)
+    assert profile_agent.prompt.max_tokens == 512
+    llm.complete_json = AsyncMock(return_value=ProfileProposalPayload())  # type: ignore[method-assign]
+    await profile_agent.run(snap, mode="bootstrap")
+    assert llm.complete_json.call_args.kwargs["max_tokens"] == 512
+
+    # 3) Strategy: 768 tok budget + 5 concise touches cap
+    strategy_agent = StrategyAgent(llm)
+    assert strategy_agent.prompt.max_tokens == 768
+    five_touch_plan = CampaignPlan(
+        objective="disclosure",
+        primary_hook="h_1",
+        touches=[
+            TouchSpec(n=i, channel="email", intent=f"touch {i}", hook="h_1", escalation=i)
+            for i in range(1, 6)
+        ],
+    )
+    llm.complete_json = AsyncMock(return_value=five_touch_plan)  # type: ignore[method-assign]
+    await strategy_agent.run(snap, mode="plan")
+    assert llm.complete_json.call_args.kwargs["max_tokens"] == 768
+    sent_messages = llm.complete_json.call_args.args[0]
+    sent_ctx = json.loads(sent_messages[1]["content"])
+    assert sent_ctx["budget"]["remaining_to_plan"] == 5
+    await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_osint_engine_includes_focus_in_burst1_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.osint import providers
+
+    captured: list[str] = []
+
+    async def fake_tavily(_http: object, _key: str, query: str) -> list[Source]:
+        captured.append(query)
+        return [Source(provider="tavily", kind="search", label="t", url="https://revel8.ai", title="Hit", text="Info", ok=True)]
+
+    monkeypatch.setattr(providers, "tavily_search", fake_tavily)
+    eng = OsintEngine(tavily_key="k", burst3_s=0.0)
+    await eng.run("Julius Muth", "revel8", focus="SOC2 vendor stack")
+    assert any("SOC2 vendor stack" in q for q in captured)
 
 
 def test_email_auto_linkify_first_name_signoff_and_attachment_guards() -> None:

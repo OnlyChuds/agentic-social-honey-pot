@@ -280,12 +280,16 @@ class RunManager:
             if aggressive:
                 cmd.append("--aggressive")
 
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(self.project_root),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            logs_dir = target_dir / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_path = logs_dir / f"{run_id}.log"
+            with log_path.open("ab") as log_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.project_root),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
 
             info = ActiveRunInfo(
                 run_id=run_id,

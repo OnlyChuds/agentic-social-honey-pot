@@ -548,52 +548,63 @@ class IdentityAgent(BaseAgent):
         strict_domain_check: bool = True,
     ) -> tuple[IdentityOutput, Proposal]:
         """Generate structured identity output, validate domain compliance, and build Proposal."""
-        ctx = self._build_context(
-            snapshot,
-            mode=mode,
-            sender_concept=sender_concept,
-            org_branding=org_branding,
-            landing_page_spec=landing_page_spec,
-            qa_feedback=qa_feedback,
-            previous_html=previous_html,
-        )
-        try:
-            if (
-                mode in {"landing_page", "revise"}
-                and snapshot.identity is not None
-                and landing_page_spec is not None
-            ):
-                output = await asyncio.wait_for(
-                    self.run_json(ctx, IdentityOutput),
-                    timeout=65.0,
-                )
-            else:
-                output = await self.run_json(ctx, IdentityOutput)
-        except Exception as exc:
-            if (
-                mode in {"landing_page", "revise"}
-                and snapshot.identity is not None
-                and landing_page_spec is not None
-            ):
-                logger.warning(
-                    "Identity %s LLM call failed (%s: %s); falling back to branded template.",
-                    mode,
-                    type(exc).__name__,
-                    exc,
-                )
-                output = IdentityOutput(
-                    manifest=snapshot.identity.model_copy(deep=True),
-                    page_html=render_landing_page(landing_page_spec, snapshot.identity),
-                )
-            elif mode == "bootstrap":
-                logger.warning(
-                    "Identity bootstrap LLM call failed (%s: %s); using deterministic fallback persona.",
-                    type(exc).__name__,
-                    exc,
-                )
-                output = self._fallback_bootstrap_identity(snapshot, sender_concept=sender_concept)
-            else:
-                raise
+        if (
+            mode == "landing_page"
+            and snapshot.identity is not None
+            and landing_page_spec is not None
+        ):
+            manifest_copy = snapshot.identity.model_copy(deep=True)
+            output = IdentityOutput(
+                manifest=manifest_copy,
+                page_html=render_landing_page(landing_page_spec, manifest_copy),
+            )
+        else:
+            ctx = self._build_context(
+                snapshot,
+                mode=mode,
+                sender_concept=sender_concept,
+                org_branding=org_branding,
+                landing_page_spec=landing_page_spec,
+                qa_feedback=qa_feedback,
+                previous_html=previous_html,
+            )
+            try:
+                if (
+                    mode == "revise"
+                    and snapshot.identity is not None
+                    and landing_page_spec is not None
+                ):
+                    output = await asyncio.wait_for(
+                        self.run_json(ctx, IdentityOutput),
+                        timeout=65.0,
+                    )
+                else:
+                    output = await self.run_json(ctx, IdentityOutput)
+            except Exception as exc:
+                if (
+                    mode in {"landing_page", "revise"}
+                    and snapshot.identity is not None
+                    and landing_page_spec is not None
+                ):
+                    logger.warning(
+                        "Identity %s LLM call failed (%s: %s); falling back to branded template.",
+                        mode,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    output = IdentityOutput(
+                        manifest=snapshot.identity.model_copy(deep=True),
+                        page_html=render_landing_page(landing_page_spec, snapshot.identity),
+                    )
+                elif mode == "bootstrap":
+                    logger.warning(
+                        "Identity bootstrap LLM call failed (%s: %s); using deterministic fallback persona.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    output = self._fallback_bootstrap_identity(snapshot, sender_concept=sender_concept)
+                else:
+                    raise
 
         if (
             mode == "bootstrap"
@@ -678,6 +689,8 @@ class IdentityAgent(BaseAgent):
                     output.manifest.domain,
                     output.manifest.email,
                 )
+                if mode == "landing_page" and landing_page_spec is not None:
+                    output.page_html = render_landing_page(landing_page_spec, output.manifest)
                 domains_to_check = [
                     d for d in (output.manifest.domain, output.manifest.email) if d.strip()
                 ]

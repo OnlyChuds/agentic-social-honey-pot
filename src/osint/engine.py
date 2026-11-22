@@ -108,23 +108,41 @@ class OsintEngine:
         )
         try:
             name_org = f"{name} {org}".strip()
+            focus_clean = focus.strip()
             b1_t0 = time.monotonic()
             b1_tasks: list[Awaitable[list[Source] | Source]] = []
             if self.jina_key:
                 b1_tasks.append(providers.jina_search(http, self.jina_key, name_org))
-                b1_tasks.append(
-                    providers.jina_search(http, self.jina_key, f"{name_org} linkedin podcast interview speaker funding")
-                )
+                if focus_clean:
+                    b1_tasks.append(
+                        providers.jina_search(http, self.jina_key, f"{name_org} {focus_clean}")
+                    )
+                else:
+                    b1_tasks.append(
+                        providers.jina_search(
+                            http,
+                            self.jina_key,
+                            f"{name_org} linkedin podcast interview speaker funding",
+                        )
+                    )
             if self.exa_key:
                 b1_tasks.append(providers.exa_search(http, self.exa_key, name_org, category="personal site"))
-                b1_tasks.append(
-                    providers.exa_search(
-                        http, self.exa_key, f"{name_org} interview OR podcast OR keynote OR funding"
+                if focus_clean:
+                    b1_tasks.append(
+                        providers.exa_search(http, self.exa_key, f"{name_org} {focus_clean}")
                     )
-                )
+                else:
+                    b1_tasks.append(
+                        providers.exa_search(
+                            http,
+                            self.exa_key,
+                            f"{name_org} interview OR podcast OR keynote OR funding",
+                        )
+                    )
                 b1_tasks.append(providers.exa_search(http, self.exa_key, org, category="company"))
             if self.tavily_key:
-                b1_tasks.append(providers.tavily_search(http, self.tavily_key, name_org))
+                tavily_q = f"{name_org} {focus_clean}".strip() if focus_clean else name_org
+                b1_tasks.append(providers.tavily_search(http, self.tavily_key, tavily_q))
             burst1 = await self._stage(b1_tasks, cap_s=self.burst1_s, result=result)
             result.timings["burst1_s"] = time.monotonic() - b1_t0
             result.sources.extend(burst1)

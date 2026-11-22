@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { createOfflineReplay } from "@/lib/api";
 import type { LaunchRunResponse, TargetSummary } from "@/lib/types";
-import { cn, formatScore, getStageTextClass, getSuspicionBand } from "@/lib/utils";
+import { cn, formatDuration, formatScore, getStageTextClass, getSuspicionBand } from "@/lib/utils";
 
 interface TargetSidebarProps {
   targets: TargetSummary[];
@@ -168,8 +168,18 @@ export function TargetSidebar({
                       />
                       Suspicion {formatScore(item.latest_suspicion)}
                     </span>
-                    <span>
-                      {item.touches_used}/{item.session_max}
+                    <span className="inline-flex items-center gap-2">
+                      {item.is_running && item.active_stage ? (
+                        <span className="text-emerald-400">
+                          {item.active_stage}
+                          {item.active_mode ? `:${item.active_mode}` : ""}
+                        </span>
+                      ) : item.total_elapsed_ms !== null && item.total_elapsed_ms !== undefined ? (
+                        <span>{formatDuration(item.total_elapsed_ms)}</span>
+                      ) : null}
+                      <span>
+                        {item.touches_used}/{item.session_max}
+                      </span>
                     </span>
                   </div>
                 </button>

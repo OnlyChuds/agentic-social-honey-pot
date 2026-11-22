@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,9 +155,29 @@ class Orchestrator:
     ) -> Proposal | None:
         if agent is None:
             return None
+        t0 = time.monotonic()
+        mode_raw = kwargs.get("mode")
+        mode_str = str(mode_raw) if mode_raw is not None else None
+        step_id = uuid4().hex[:8]
+        self.state.record_stage_start(name, mode=mode_str, step_id=step_id)
         try:
-            return await agent.run(self.snapshot.model_copy(deep=True), **kwargs)
+            proposal = await agent.run(self.snapshot.model_copy(deep=True), **kwargs)
+            self.state.record_stage_timing(
+                name,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                ok=True,
+                mode=mode_str,
+                step_id=step_id,
+            )
+            return proposal
         except Exception as exc:  # noqa: BLE001
+            self.state.record_stage_timing(
+                name,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                mode=mode_str,
+                step_id=step_id,
+            )
             self.state.record_system_error(name, f"{type(exc).__name__}: {exc}", context=kwargs)
             return None
 
@@ -654,9 +675,24 @@ class Orchestrator:
             self.state.transition_state("ABORT", reason="missing active session_id")
             return self.snapshot
 
-        # Self-heal if plan is missing (e.g. recovered after a bootstrap strategy failure)
-        if self.snapshot.campaign.plan is None and self.agents.strategy is not None:
-            plan_prop = await self._safe_run_agent("strategy", self.agents.strategy, mode="plan")
+        # Self-heal if plan is missing or rolling touch horizon has been exhausted
+        plan_obj = self.snapshot.campaign.plan
+        next_n = self.snapshot.campaign.budget.used + 1
+        horizon_exhausted = (
+            plan_obj is not None
+            and bool(plan_obj.touches)
+            and next_n > max(t.n for t in plan_obj.touches)
+        )
+        if (plan_obj is None or horizon_exhausted) and self.agents.strategy is not None:
+            plan_reason = "plan horizon reached" if horizon_exhausted else None
+            if plan_reason:
+                actions.append(_action("trigger", agent="strategy", reason=plan_reason))
+            plan_prop = await self._safe_run_agent(
+                "strategy",
+                self.agents.strategy,
+                mode="plan",
+                reason=plan_reason,
+            )
             if plan_prop is not None:
                 actions.extend(self._actions_from_commits([self.state.commit_proposal(plan_prop)]))
 
@@ -848,6 +884,9 @@ class Orchestrator:
         idempotency_key = str(uuid4())
 
         # Execute send via Target API
+        api_t0 = time.monotonic()
+        api_step_id = uuid4().hex[:8]
+        self.state.record_stage_start("target_api", mode=channel, step_id=api_step_id)
         try:
             if self.policy.is_live_channel(channel):
                 cid = self._active_conversations.get(channel)
@@ -884,7 +923,21 @@ class Orchestrator:
                     required_page_url=required_page_url,
                     idempotency_key=idempotency_key,
                 )
+            self.state.record_stage_timing(
+                "target_api",
+                elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                ok=True,
+                mode=channel,
+                step_id=api_step_id,
+            )
         except BudgetExhaustedError as exc:
+            self.state.record_stage_timing(
+                "target_api",
+                elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                ok=False,
+                mode=channel,
+                step_id=api_step_id,
+            )
             self.state.record_system_error("api", str(exc))
             self.state.transition_state("DONE", reason="API returned 409 budget/session exhausted")
             self.state.log_decision(
@@ -897,6 +950,13 @@ class Orchestrator:
             )
             return self.snapshot
         except SimulatorRejectionError as exc:
+            self.state.record_stage_timing(
+                "target_api",
+                elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                ok=False,
+                mode=channel,
+                step_id=api_step_id,
+            )
             self.state.record_system_error("api", str(exc))
             actions.append(
                 _action(
@@ -923,6 +983,13 @@ class Orchestrator:
             )
             return self.snapshot
         except (PageNotRegisteredError, TargetAPIError) as exc:
+            self.state.record_stage_timing(
+                "target_api",
+                elapsed_ms=int((time.monotonic() - api_t0) * 1000),
+                ok=False,
+                mode=channel,
+                step_id=api_step_id,
+            )
             self.state.record_system_error("api", str(exc))
             self.state.log_decision(
                 DecisionRecord(
@@ -1018,13 +1085,9 @@ class Orchestrator:
                     suspicion = float(sig_prop.payload.get("suspicion", 0.0))
                     self.policy.record_signal(engagement=engagement, suspicion=suspicion)
 
-        # Profile update (batched every >=2 target events, or when reply might hold disclosure)
+        # Profile update (batched every >=2 target events, or on every reply for opportunistic disclosure wins)
         disclosure_candidates: list[dict[str, Any]] | None = None
-        should_profile = self.policy.should_trigger_profile() or (
-            had_reply
-            and self.snapshot.campaign.plan is not None
-            and self.snapshot.campaign.plan.objective == "disclosure"
-        )
+        should_profile = self.policy.should_trigger_profile() or had_reply
         if should_profile and self.agents.profile is not None:
             actions.append(_action("trigger", agent="profile", reason="target event batch"))
             prof_prop = await self._safe_run_agent(
@@ -1126,12 +1189,24 @@ class Orchestrator:
         return self.snapshot
 
     async def run(self, *, max_cycles: int = 50) -> Snapshot:
-        if self.snapshot.run.state == "BOOT":
-            await self.bootstrap()
+        exit_reason = "unknown"
+        try:
+            if self.snapshot.run.state == "BOOT":
+                await self.bootstrap()
 
-        cycles = 0
-        while self.snapshot.run.state not in {"WIN", "ABORT", "DONE"} and cycles < max_cycles:
-            await self.step()
-            cycles += 1
-        await self._close_active_conversations()
+            cycles = 0
+            while self.snapshot.run.state not in {"WIN", "ABORT", "DONE"} and cycles < max_cycles:
+                await self.step()
+                cycles += 1
+
+            if self.snapshot.run.state in {"WIN", "DONE", "ABORT"}:
+                exit_reason = "completed"
+            elif cycles >= max_cycles:
+                exit_reason = "cycle_limit"
+        except Exception:
+            exit_reason = "service_failure"
+            raise
+        finally:
+            await self._close_active_conversations()
+            self.state.record_run_exit(exit_reason)
         return self.snapshot

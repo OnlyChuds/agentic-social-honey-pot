@@ -374,7 +374,11 @@ class StateManager:
                 if existing.claim != fact.claim:
                     existing.status = "superseded"
                     replacement = fact.model_copy(deep=True)
-                    replacement.fact_id = f"{fact.fact_id}_v2"
+                    base_id = fact.fact_id.split("_v", 1)[0]
+                    rev = 2
+                    while f"{base_id}_v{rev}" in by_id:
+                        rev += 1
+                    replacement.fact_id = f"{base_id}_v{rev}"
                     existing.superseded_by = replacement.fact_id
                     self.snapshot.facts.append(replacement)
                     by_id[replacement.fact_id] = replacement
@@ -669,6 +673,65 @@ class StateManager:
                 "failed_actor": actor,
                 "error": error,
                 "context": context or {},
+            },
+        )
+        self.store.append_event(ev)
+        return ev
+
+    def record_stage_start(
+        self,
+        stage: str,
+        *,
+        mode: str | None = None,
+        step_id: str | None = None,
+    ) -> Event:
+        ev = Event(
+            type="system",
+            actor="orchestrator",
+            base_version=self.snapshot.version,
+            payload={
+                "kind": "stage_start",
+                "stage": stage,
+                "mode": mode or "",
+                "step_id": step_id or "",
+            },
+        )
+        self.store.append_event(ev)
+        return ev
+
+    def record_stage_timing(
+        self,
+        stage: str,
+        *,
+        elapsed_ms: int,
+        ok: bool,
+        mode: str | None = None,
+        step_id: str | None = None,
+    ) -> Event:
+        ev = Event(
+            type="system",
+            actor="orchestrator",
+            base_version=self.snapshot.version,
+            payload={
+                "kind": "stage_timing",
+                "stage": stage,
+                "mode": mode or "",
+                "step_id": step_id or "",
+                "elapsed_ms": max(0, int(elapsed_ms)),
+                "ok": ok,
+            },
+        )
+        self.store.append_event(ev)
+        return ev
+
+    def record_run_exit(self, reason: str) -> Event:
+        ev = Event(
+            type="system",
+            actor="orchestrator",
+            base_version=self.snapshot.version,
+            payload={
+                "kind": "run_exit",
+                "reason": reason,
             },
         )
         self.store.append_event(ev)

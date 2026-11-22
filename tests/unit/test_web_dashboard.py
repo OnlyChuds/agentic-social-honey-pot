@@ -39,11 +39,16 @@ EXPECTED_SUMMARY_KEYS: set[str] = {
     "latest_version",
     "updated_at",
     "is_running",
+    "active_stage",
+    "active_mode",
+    "total_elapsed_ms",
+    "exit_reason",
 }
 
 EXPECTED_DETAIL_KEYS: set[str] = {
     "run_id",
     "summary",
+    "execution_status",
     "latest_snapshot",
     "stage_history",
     "signal_series",
@@ -436,3 +441,40 @@ async def test_inline_images_attachments_and_asset_serving(tmp_path: Path) -> No
                 assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
     finally:
         manager.shutdown()
+
+
+def test_execution_status_tracks_live_and_completed_stages(tmp_path: Path) -> None:
+    from src.models import RunMeta, Snapshot, TargetInfo
+    from src.orchestrator.state import StateManager
+
+    db_path = tmp_path / "practice_julius_run9.db"
+    with Store(db_path) as store:
+        sm = StateManager(
+            store,
+            Snapshot(
+                version=1,
+                run=RunMeta(scenario="practice", target_id="julius", state="RESEARCH"),
+                target=TargetInfo(id="julius", name="Julius Muth", role="Co-CEO", org="revel8"),
+            ),
+        )
+        sm.record_stage_start("osint", mode="bootstrap", step_id="s1")
+        sm.record_stage_timing("osint", mode="bootstrap", step_id="s1", elapsed_ms=12500, ok=True)
+        sm.record_stage_start("strategy", mode="plan", step_id="s2")
+
+    detail = get_target_detail(db_path, is_running=True)
+    status = detail["execution_status"]
+    assert status["is_running"] is True
+    assert len(status["completed_steps"]) == 1
+    assert status["completed_steps"][0]["stage"] == "osint"
+    assert status["completed_steps"][0]["elapsed_ms"] == 12500
+    assert len(status["active_steps"]) == 1
+    assert status["active_steps"][0]["stage"] == "strategy"
+    assert status["active_steps"][0]["mode"] == "plan"
+    assert status["stage_totals"][0]["stage"] == "osint"
+    assert status["stage_totals"][0]["total_ms"] == 12500
+    assert detail["summary"]["active_stage"] == "strategy"
+    assert detail["summary"]["active_mode"] == "plan"
+
+    listed = list_targets(tmp_path, running_run_ids={"practice_julius_run9"})
+    assert listed["targets"][0]["active_stage"] == "strategy"
+    assert listed["targets"][0]["is_running"] is True

@@ -21,6 +21,8 @@ from src.models import (
 )
 
 logger = logging.getLogger(__name__)
+_STRATEGY_MAX_TOKENS = 768
+_STRATEGY_MAX_TOUCHES = 5
 
 
 _CREDENTIAL_FIELD_KEYWORDS: tuple[str, ...] = (
@@ -225,11 +227,11 @@ class StrategyAgent(BaseAgent):
             cap = (
                 self.config.aggressive.budget.compressed_plan_touches
                 if self.config is not None
-                else 8
+                else _STRATEGY_MAX_TOUCHES
             )
-            max_touches = min(remaining, cap)
+            max_touches = min(remaining, cap, _STRATEGY_MAX_TOUCHES)
         else:
-            max_touches = min(remaining, 10)
+            max_touches = min(remaining, _STRATEGY_MAX_TOUCHES)
 
         ranked_hooks = sorted(
             [h for h in snapshot.hooks if h.status != "exhausted"],
@@ -291,16 +293,22 @@ class StrategyAgent(BaseAgent):
                 "give_up (str)",
                 "session_restart ({recommended: bool, reason: str | null})",
             ],
+            "instructions": (
+                "Return ONLY compact minified JSON (no indentation, <=768 tokens) with at most "
+                f"{max_touches} concise touches starting at n={used + 1}: <=10-word intent, "
+                "<=6-word stop_if, and <=2 short pivot_triggers."
+            ),
         }
 
         messages = self.build_messages(context)
+        strategy_max_tokens = min(self.prompt.max_tokens, _STRATEGY_MAX_TOKENS)
         try:
             plan = await asyncio.wait_for(
                 self.llm.complete_json(
                     messages,
                     CampaignPlan,
                     temperature=self.prompt.temperature,
-                    max_tokens=self.prompt.max_tokens,
+                    max_tokens=strategy_max_tokens,
                     retries=1,
                 ),
                 timeout=85.0,
@@ -342,7 +350,7 @@ class StrategyAgent(BaseAgent):
                         repair_messages,
                         CampaignPlan,
                         temperature=0.2,
-                        max_tokens=self.prompt.max_tokens,
+                        max_tokens=strategy_max_tokens,
                         retries=0,
                     ),
                     timeout=65.0,

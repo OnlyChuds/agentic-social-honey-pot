@@ -69,6 +69,13 @@ def test_page_artifact_spec_shared_and_harvest_types_complete() -> None:
         (LandingPageSpec(pretext="Standard portal login", fields=["email"]), "portal_login"),
         # Field signature takes precedence over pretext keywords
         (LandingPageSpec(pretext="Portal access", fields=["email", "otp"]), "mfa_reauth"),
+        # Regression: ["email", "password"] must never pick mfa_reauth (or non-password templates)
+        (LandingPageSpec(pretext="Partner Portal Verification", fields=["email", "password"]), "portal_login"),
+        (LandingPageSpec(pretext="Verify device MFA", fields=["email", "password"]), "portal_login"),
+        (LandingPageSpec(pretext="Speaker Portal Verification", fields=["email", "password"]), "portal_login"),
+        (LandingPageSpec(pretext="Account verification", fields=["email", "password"]), "portal_login"),
+        (LandingPageSpec(pretext="Password verification reset", fields=["email", "password"]), "password_reset"),
+        (LandingPageSpec(pretext="Signed document verification", fields=["email", "password"]), "document_vault"),
     ],
 )
 def test_select_harvest_type(spec: LandingPageSpec, expected: HarvestType) -> None:

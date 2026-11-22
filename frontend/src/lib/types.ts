@@ -23,6 +23,10 @@ export interface TargetSummary {
   latest_version: number;
   updated_at: string;
   is_running: boolean;
+  active_stage?: string | null;
+  active_mode?: string | null;
+  total_elapsed_ms?: number | null;
+  exit_reason?: string | null;
 }
 
 export interface TargetListResponse {
@@ -283,9 +287,50 @@ export interface WatchoutEntry {
   ts: string;
 }
 
+export interface ActiveStageStep {
+  step_id: string;
+  stage: string;
+  mode: string;
+  started_at: string;
+  elapsed_ms: number;
+}
+
+export interface CompletedStageStep {
+  step_id: string;
+  stage: string;
+  mode: string;
+  started_at: string;
+  finished_at: string;
+  elapsed_ms: number;
+  ok: boolean;
+  inferred?: boolean;
+}
+
+export interface StageTimingSummary {
+  stage: string;
+  calls: number;
+  failures: number;
+  total_ms: number;
+  avg_ms: number;
+  max_ms: number;
+  last_ms: number;
+}
+
+export interface ExecutionStatus {
+  is_running: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  total_elapsed_ms: number;
+  exit_reason: string | null;
+  active_steps: ActiveStageStep[];
+  completed_steps: CompletedStageStep[];
+  stage_totals: StageTimingSummary[];
+}
+
 export interface TargetDetailResponse {
   run_id: string;
   summary: TargetSummary;
+  execution_status?: ExecutionStatus;
   latest_snapshot: SnapshotJSON;
   stage_history: StageTransition[];
   signal_series: SignalPoint[];

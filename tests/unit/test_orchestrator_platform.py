@@ -847,3 +847,87 @@ async def test_mock_api_sample_images_and_asset_endpoints() -> None:
 
         missing = await http.get("/v1/assets/a_999")
         assert missing.status_code == 404
+
+
+def test_fact_superseding_generates_unique_versions(tmp_path: Path) -> None:
+    with Store(tmp_path / "facts.db") as store:
+        sm = StateManager(store)
+        for idx, claim in enumerate(("Claim A", "Claim B", "Claim C"), start=1):
+            prop = Proposal(
+                agent="osint",
+                kind="facts",
+                base_version=sm.snapshot.version,
+                payload={"facts": [{"fact_id": "f_1", "claim": claim}]},
+            )
+            res = sm.commit_proposal(prop)
+            assert res.accepted, f"commit {idx} failed: {res.reason}"
+
+        ids = [f.fact_id for f in sm.snapshot.facts]
+        assert ids == ["f_1", "f_1_v2", "f_1_v3"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_replans_when_rolling_horizon_exhausted_and_records_run_exit(
+    tmp_path: Path,
+) -> None:
+    from scripts.summarize_runs import summarize_run
+    from src.models import CampaignPlan, TouchSpec
+
+    plan_calls: list[tuple[str | None, int]] = []
+
+    class _ShortHorizonStrategy:
+        async def run(self, snapshot: Snapshot, **kwargs: Any) -> Proposal:
+            used = snapshot.campaign.budget.used
+            plan_calls.append((kwargs.get("reason"), used))
+            start_n = used + 1
+            plan = CampaignPlan(
+                objective="disclosure",
+                primary_hook="h_stub_01",
+                touches=[
+                    TouchSpec(
+                        n=start_n,
+                        channel="email",
+                        intent=f"touch {start_n}",
+                        hook="h_stub_01",
+                        escalation=min(5, start_n),
+                    )
+                ],
+            )
+            return Proposal(
+                agent="strategy",
+                kind="plan",
+                base_version=snapshot.version,
+                payload={"plan": plan.model_dump(mode="json")},
+            )
+
+    agents = build_stub_agents(objective="disclosure")
+    agents.strategy = _ShortHorizonStrategy()
+    db_path = tmp_path / "horizon.db"
+    store = Store(db_path)
+    cfg = AppConfig()
+    cfg.run.scenario = "practice"
+    cfg.run.target_id = "julius"
+    mock_state = MockTargetState(persona_by_target={"julius": "silent"})
+    client, _ = _make_mock_client(mock_state, store=store)
+    orch = Orchestrator(
+        config=cfg,
+        state=StateManager(store),
+        api=client,
+        agents=agents,
+        policy=TriggerPolicy(min_gap_s=0.0, no_reply_pivot_threshold=99),
+        sleep=_noop_sleep,
+    )
+    snap = await orch.run(max_cycles=2)
+    assert snap.campaign.budget.used == 2
+    assert any(reason == "plan horizon reached" and used == 1 for reason, used in plan_calls)
+
+    events = store.get_events()
+    assert any(e.type == "system" and e.payload.get("kind") == "stage_timing" for e in events)
+    assert events[-1].type == "system"
+    assert events[-1].payload == {"kind": "run_exit", "reason": "cycle_limit"}
+
+    report = summarize_run(db_path)
+    assert report["exit_reason"] == "cycle_limit"
+
+    await client._client.aclose()
+    store.close()

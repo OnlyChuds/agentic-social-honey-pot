@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import re
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,6 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from src.models import utc_now_iso
-from src.store.db import Store
 from src.web.demo_seed import seed_demo_data
 from src.web.offline_replay import write_acknowledgment_replay
 from src.web.queries import get_snapshot_at_version, get_target_detail, list_targets
@@ -52,6 +52,25 @@ def _resolve_db_path(data_dir: Path, run_id: str) -> Path:
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     return candidate
+
+
+def _read_asset_readonly(db_path: Path, asset_id: str) -> tuple[str, str] | None:
+    """Look up (local_path, content_type) for an asset using a read-only SQLite connection."""
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT local_path, content_type FROM assets WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row[0]), str(row[1])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
 
 
 def _compute_stream_fingerprint(
@@ -171,14 +190,17 @@ def create_app(
         db_path = _resolve_db_path(resolved_dir, run_id)
         if not ASSET_ID_RE.match(asset_id) or ".." in asset_id:
             raise HTTPException(status_code=400, detail=f"Invalid asset_id: {asset_id!r}")
-        with Store(db_path) as store:
-            asset = store.get_asset(asset_id)
+        asset = _read_asset_readonly(db_path, asset_id)
         if asset is None:
             raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
-        local_file = Path(asset.local_path)
+        raw_path, content_type = asset
+        local_file = Path(raw_path).resolve()
+        allowed_roots = (resolved_dir.resolve(), Path("data").resolve())
+        if not any(local_file.is_relative_to(root) for root in allowed_roots):
+            raise HTTPException(status_code=403, detail=f"Asset path outside data directory: {asset_id}")
         if not local_file.is_file():
             raise HTTPException(status_code=404, detail=f"Asset file missing on disk: {asset_id}")
-        return FileResponse(path=local_file, media_type=asset.content_type)
+        return FileResponse(path=local_file, media_type=content_type)
 
     async def api_launch_run(req: LaunchRunRequest) -> dict[str, Any]:
         if req.scenario != "practice":

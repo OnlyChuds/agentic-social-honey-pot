@@ -191,6 +191,204 @@ def _compute_updated_at(
     return _file_mtime_iso(db_path)
 
 
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except ValueError:
+        return None
+
+
+def _build_execution_status(
+    *,
+    events: list[Event],
+    latest: Snapshot,
+    is_running: bool,
+    fallback_ts: str,
+) -> dict[str, Any]:
+    """Build live & historical per-stage execution telemetry for one campaign run.
+
+    Uses explicit ``stage_start`` / ``stage_timing`` events when present, and
+    gracefully falls back to inferring completed stage steps from ``agent_output``
+    event timestamps for older saved databases.
+    """
+    now_dt = datetime.now(UTC)
+    started_at: str | None = events[0].ts if events else None
+    last_event_ts: str | None = events[-1].ts if events else None
+    exit_reason: str | None = None
+
+    has_explicit_timings = any(
+        ev.type == "system" and ev.payload.get("kind") in {"stage_start", "stage_timing"}
+        for ev in events
+    )
+
+    open_steps: dict[str, dict[str, Any]] = {}
+    open_order: list[str] = []
+    completed_steps: list[dict[str, Any]] = []
+    seq_counter = 0
+
+    for ev in events:
+        if ev.type == "system":
+            kind = ev.payload.get("kind")
+            if kind == "run_exit":
+                raw_reason = ev.payload.get("reason")
+                if isinstance(raw_reason, str) and raw_reason.strip():
+                    exit_reason = raw_reason.strip()
+            elif kind == "stage_start":
+                seq_counter += 1
+                stage = str(ev.payload.get("stage") or "unknown")
+                mode = str(ev.payload.get("mode") or "")
+                step_id = str(ev.payload.get("step_id") or f"step_{seq_counter}")
+                open_steps[step_id] = {
+                    "step_id": step_id,
+                    "stage": stage,
+                    "mode": mode,
+                    "started_at": ev.ts,
+                }
+                open_order.append(step_id)
+            elif kind == "stage_timing":
+                seq_counter += 1
+                stage = str(ev.payload.get("stage") or "unknown")
+                mode = str(ev.payload.get("mode") or "")
+                step_id = str(ev.payload.get("step_id") or "")
+                elapsed_ms = max(0, int(ev.payload.get("elapsed_ms") or 0))
+                ok = bool(ev.payload.get("ok", True))
+
+                matched = open_steps.pop(step_id, None) if step_id else None
+                if matched is None:
+                    # Fallback match by stage+mode when step_id was omitted
+                    for oid in open_order:
+                        cand = open_steps.get(oid)
+                        if cand is not None and cand["stage"] == stage and cand["mode"] == mode:
+                            matched = open_steps.pop(oid)
+                            break
+
+                completed_steps.append(
+                    {
+                        "step_id": step_id or (matched["step_id"] if matched else f"step_{seq_counter}"),
+                        "stage": stage,
+                        "mode": mode,
+                        "started_at": matched["started_at"] if matched else ev.ts,
+                        "finished_at": ev.ts,
+                        "elapsed_ms": elapsed_ms,
+                        "ok": ok,
+                        "inferred": False,
+                    }
+                )
+
+    if not has_explicit_timings:
+        prev_dt = _parse_iso_dt(started_at)
+        for idx, ev in enumerate(events, start=1):
+            cur_dt = _parse_iso_dt(ev.ts)
+            if ev.type == "agent_output" and ev.actor in {
+                "osint",
+                "identity",
+                "profile",
+                "strategy",
+                "messaging",
+                "qa",
+            }:
+                delta_ms = 0
+                if prev_dt is not None and cur_dt is not None:
+                    delta_ms = max(0, int((cur_dt - prev_dt).total_seconds() * 1000))
+                kind_str = str(ev.payload.get("kind") or ev.payload.get("direction") or "")
+                completed_steps.append(
+                    {
+                        "step_id": f"inferred_{idx}",
+                        "stage": str(ev.actor),
+                        "mode": kind_str,
+                        "started_at": prev_dt.isoformat().replace("+00:00", "Z") if prev_dt else ev.ts,
+                        "finished_at": ev.ts,
+                        "elapsed_ms": delta_ms,
+                        "ok": True,
+                        "inferred": True,
+                    }
+                )
+            if cur_dt is not None:
+                prev_dt = cur_dt
+
+    # Active steps: any open stage_start when run is still active (or not yet exited)
+    is_terminal = latest.run.state in {"WIN", "DONE", "ABORT"} or exit_reason is not None
+    effectively_running = is_running or (bool(open_steps) and not is_terminal)
+    active_steps: list[dict[str, Any]] = []
+    if effectively_running:
+        for oid in open_order:
+            item = open_steps.get(oid)
+            if item is None:
+                continue
+            st_dt = _parse_iso_dt(item["started_at"])
+            elapsed_ms = (
+                max(0, int((now_dt - st_dt).total_seconds() * 1000))
+                if st_dt is not None
+                else 0
+            )
+            active_steps.append(
+                {
+                    "step_id": item["step_id"],
+                    "stage": item["stage"],
+                    "mode": item["mode"],
+                    "started_at": item["started_at"],
+                    "elapsed_ms": elapsed_ms,
+                }
+            )
+
+    # Per-stage rollup
+    stage_agg: dict[str, dict[str, Any]] = {}
+    for step in completed_steps:
+        stage = step["stage"]
+        bucket = stage_agg.setdefault(
+            stage,
+            {
+                "stage": stage,
+                "calls": 0,
+                "failures": 0,
+                "total_ms": 0,
+                "max_ms": 0,
+                "last_ms": 0,
+            },
+        )
+        ms = int(step["elapsed_ms"])
+        bucket["calls"] += 1
+        if not step["ok"]:
+            bucket["failures"] += 1
+        bucket["total_ms"] += ms
+        bucket["max_ms"] = max(bucket["max_ms"], ms)
+        bucket["last_ms"] = ms
+
+    stage_totals: list[dict[str, Any]] = []
+    for bucket in sorted(stage_agg.values(), key=lambda x: x["total_ms"], reverse=True):
+        calls = max(1, bucket["calls"])
+        stage_totals.append(
+            {
+                **bucket,
+                "avg_ms": round(bucket["total_ms"] / calls),
+            }
+        )
+
+    start_dt = _parse_iso_dt(started_at)
+    end_dt = None if effectively_running else _parse_iso_dt(last_event_ts or fallback_ts)
+    if start_dt is not None:
+        ref_end = now_dt if effectively_running else (end_dt or start_dt)
+        total_elapsed_ms = max(0, int((ref_end - start_dt).total_seconds() * 1000))
+    else:
+        total_elapsed_ms = sum(int(s["elapsed_ms"]) for s in completed_steps)
+
+    return {
+        "is_running": effectively_running,
+        "started_at": started_at,
+        "finished_at": None if effectively_running else (last_event_ts or fallback_ts),
+        "total_elapsed_ms": total_elapsed_ms,
+        "exit_reason": exit_reason,
+        "active_steps": active_steps,
+        "completed_steps": completed_steps,
+        "stage_totals": stage_totals,
+    }
+
+
 def _build_target_summary(
     *,
     db_path: Path,
@@ -200,10 +398,20 @@ def _build_target_summary(
     decisions: list[DecisionRecord],
     signal_series: list[dict[str, Any]],
     is_running: bool,
+    execution_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     latest_sig = signal_series[-1] if signal_series else None
     target_id = latest.target.id or latest.run.target_id or db_path.stem
     target_name = latest.target.name or target_id
+    exec_info = execution_status or _build_execution_status(
+        events=events,
+        latest=latest,
+        is_running=is_running,
+        fallback_ts=_file_mtime_iso(db_path),
+    )
+    active_steps = exec_info.get("active_steps") or []
+    active_stage = str(active_steps[-1]["stage"]) if active_steps else None
+    active_mode = str(active_steps[-1]["mode"]) if active_steps and active_steps[-1].get("mode") else None
 
     return {
         "run_id": db_path.stem,
@@ -227,7 +435,11 @@ def _build_target_summary(
         "portrait_asset_id": _extract_portrait_asset_id(store, latest),
         "latest_version": latest.version,
         "updated_at": _compute_updated_at(db_path, latest, events, decisions),
-        "is_running": is_running,
+        "is_running": bool(exec_info["is_running"]),
+        "active_stage": active_stage,
+        "active_mode": active_mode,
+        "total_elapsed_ms": int(exec_info["total_elapsed_ms"]),
+        "exit_reason": exec_info["exit_reason"],
     }
 
 
@@ -729,6 +941,12 @@ def get_target_detail(
             fallback_ts=_file_mtime_iso(db_path),
         )
         signal_series = _extract_signal_series(events, versions, snapshots)
+        execution_status = _build_execution_status(
+            events=events,
+            latest=latest,
+            is_running=is_running,
+            fallback_ts=_file_mtime_iso(db_path),
+        )
         summary = _build_target_summary(
             db_path=db_path,
             store=store,
@@ -737,6 +955,7 @@ def get_target_detail(
             decisions=decisions,
             signal_series=signal_series,
             is_running=is_running,
+            execution_status=execution_status,
         )
         stage_history = _build_stage_history(versions, snapshots, events, version_ts)
         event_markers = _build_event_markers(versions, snapshots, events, decisions, pages)
@@ -786,6 +1005,7 @@ def get_target_detail(
         return {
             "run_id": db_path.stem,
             "summary": summary,
+            "execution_status": execution_status,
             "latest_snapshot": latest.model_dump(mode="json"),
             "stage_history": stage_history,
             "signal_series": signal_series,

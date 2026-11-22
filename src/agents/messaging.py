@@ -781,8 +781,7 @@ class MessagingAgent(BaseAgent):
         signal = await self.run_json(context, SignalAssessment, temperature=0.2)
 
         known_hook_ids = {h.hook_id for h in snapshot.hooks}
-        if known_hook_ids:
-            signal.hook_hits = [hid for hid in signal.hook_hits if hid in known_hook_ids]
+        signal.hook_hits = [hid for hid in signal.hook_hits if hid in known_hook_ids]
 
         proposal = self.make_proposal(
             snapshot,
